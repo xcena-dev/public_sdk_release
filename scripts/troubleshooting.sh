@@ -150,6 +150,18 @@ collect_pxl() {
     section "2. PXL"
 
     run_cmd "2-1. pxl_resourced journal" journalctl -u pxl_resourced.service --no-pager -n 500
+
+    # PXL daemon history log
+    local pxl_history="/tmp/pxl/history.log"
+    subsection "2-2. pxl_resourced history.log ($pxl_history)"
+    printf "  ${C_DIM}  -> %-45s${C_RESET}" "2-2. pxl history.log"
+    if [ -f "$pxl_history" ]; then
+        log "$(tail -n 500 "$pxl_history")"
+        printf "${C_GREEN}[OK]${C_RESET}\n"
+    else
+        log "(history.log not found — skipped)"
+        printf "${C_YELLOW}[SKIP]${C_RESET}\n"
+    fi
 }
 
 # ===========================================================================
