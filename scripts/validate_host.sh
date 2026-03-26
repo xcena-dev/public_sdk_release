@@ -242,6 +242,7 @@ check_cxl_dax() {
             daxctl_out="$(daxctl list 2>/dev/null)" || true
         fi
 
+        local has_non_devdax=0
         while IFS= read -r dax_dev; do
             [ -e "$dax_dev" ] || continue
             local dax_name perm dsize dmode
@@ -256,7 +257,16 @@ check_cxl_dax() {
             [ -n "$dsize" ] && line="$line  size=$(human_size "$dsize")"
             [ -n "$dmode" ] && line="$line  mode=$dmode"
             detail "$line"
+            if [ -n "$dmode" ] && [ "$dmode" != "devdax" ]; then
+                has_non_devdax=1
+            fi
         done <<< "$dax_devs"
+
+        if [ "$has_non_devdax" -eq 1 ]; then
+            warn "CXL device is not in devdax mode. devdax mode is required for computing."
+            detail "To fix: sudo daxctl reconfigure-device --mode=devdax <dax_device>"
+            detail "Then:   sudo systemctl restart pxl_resourced"
+        fi
     fi
 }
 
