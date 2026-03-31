@@ -265,7 +265,6 @@ check_cxl_dax() {
         if [ "$has_non_devdax" -eq 1 ]; then
             warn "CXL device is not in devdax mode. devdax mode is required for computing."
             detail "To fix: sudo daxctl reconfigure-device --mode=devdax <dax_device>"
-            detail "Then:   sudo systemctl restart pxl_resourced"
         fi
     fi
 }
