@@ -262,6 +262,26 @@ collect_cxl() {
         fi
     }
     printf "${C_GREEN}[OK]${C_RESET}\n"
+
+    # CXL mem device firmware version (sysfs)
+    subsection "4-7. CXL mem firmware version (sysfs)"
+    printf "  ${C_DIM}  -> %-45s${C_RESET}" "4-7. CXL mem firmware version (sysfs)"
+    local found_mem=0
+    for mem_dir in /sys/bus/cxl/devices/mem*; do
+        [ -d "$mem_dir" ] || continue
+        found_mem=1
+        local mem_name
+        mem_name="$(basename "$mem_dir")"
+        local fw_ver="N/A"
+        [ -f "$mem_dir/firmware_version" ] && fw_ver="$(cat "$mem_dir/firmware_version" 2>/dev/null)" || true
+        log "  $mem_name: firmware_version=${fw_ver:-N/A}"
+    done
+    if [ "$found_mem" -eq 1 ]; then
+        printf "${C_GREEN}[OK]${C_RESET}\n"
+    else
+        log "(no /sys/bus/cxl/devices/mem* devices found — skipped)"
+        printf "${C_YELLOW}[SKIP]${C_RESET}\n"
+    fi
 }
 
 # ===========================================================================
