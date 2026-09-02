@@ -37,6 +37,12 @@ Run this when something is wrong and you need XCENA support to look at it.
 sudo bash troubleshooting.sh
 ```
 
+Keep `validate_host.sh` in the same directory. Section 1 of the report runs it
+from there; if it is missing, the collector fetches it from a **pinned commit**
+of this repository — not from `main` — and refuses to run anything that does
+not look like the expected script. Bump `VALIDATE_HOST_REV` at the top of
+`troubleshooting.sh` whenever `validate_host.sh` changes.
+
 **Run it as root.** Without root, `dmesg`, `dmidecode`, `lspci -vv`, `acpidump`,
 `journalctl` and most of the CXL sysfs tree return nothing useful. The script
 re-executes itself under `sudo` automatically; if that is not possible it still
@@ -45,8 +51,8 @@ runs, but marks the report `_INCOMPLETE` so the recipient can tell at a glance.
 It writes two files to the current directory:
 
 ```
-troubleshooting_report_YYYY-MM-DD-HH-MM.log       full report
-troubleshooting_report_YYYY-MM-DD-HH-MM.tar.gz    same, compressed — send this one
+troubleshooting_report_YYYY-MM-DD-HH-MM-SS.log       full report
+troubleshooting_report_YYYY-MM-DD-HH-MM-SS.tar.gz    same, compressed — send this one
 ```
 
 ### Options
@@ -70,7 +76,7 @@ that produced it, so any result can be reproduced by hand.
 
 | # | Section | Contents |
 | --- | --- | --- |
-| 1 | Host Validation | Embedded `validate_host.sh` run |
+| 1 | Host Validation | `validate_host.sh`, run from the same directory or fetched at a pinned revision |
 | 2 | Host Platform & BIOS | `hostnamectl`, BIOS/board/CPU via `dmidecode`, `lscpu`, DRAM population, **PCIe slot inventory with per-slot CXL capability**, Secure Boot, clock sync |
 | 3 | Software & Tool Versions | `cxl`/`daxctl`/`ndctl`/`numactl`/`lspci` versions, XCENA packages, `modinfo mx_dma`, CXL/DAX module versions, MU toolchain |
 | 4 | Kernel | `/proc/cmdline`, `CONFIG_CXL_*` build options, loaded modules, taint state, module parameters, IOMMU/DMA remapping, `dmesg -T` plus a filtered view, previous boot's kernel journal |

@@ -2,7 +2,7 @@
 # troubleshooting.sh — XCENA debugging information collector
 #
 # Collects detailed diagnostic data for troubleshooting XCENA host issues.
-# Output is saved to troubleshooting_report_YYYY-MM-DD-HHMMSS.log (KST timezone)
+# Output is saved to troubleshooting_report_YYYY-MM-DD-HH-MM-SS.log (KST timezone)
 # and packaged into a .tar.gz alongside it.
 #
 # Usage:
@@ -19,6 +19,19 @@
 #       hardware/DIMM serial numbers, PCI topology). Review before sharing.
 
 set -u
+
+# ---------------------------------------------------------------------------
+# Pinned revision of validate_host.sh
+# ---------------------------------------------------------------------------
+# Used only when validate_host.sh is not sitting next to this script. It is a
+# commit SHA, not a branch: this collector re-executes itself as root, so
+# whatever it fetches runs as root on the customer's machine. Pointing at
+# refs/heads/main would mean that code is "whatever is on main at the moment
+# the customer runs it" — including a change nobody has released or reviewed
+# against this version of the collector. A SHA cannot be moved, unlike a tag.
+#
+# BUMP THIS whenever scripts/validate_host.sh changes, in the same PR.
+VALIDATE_HOST_REV="6f8a84234850aa4518f0673332aea36e1fe019b7"
 
 # ---------------------------------------------------------------------------
 # Options
@@ -140,7 +153,7 @@ fi
 # ---------------------------------------------------------------------------
 # Seconds included: two runs in the same minute would otherwise truncate the
 # first report and overwrite its archive.
-KST_DATETIME="$(TZ='Asia/Seoul' date '+%Y-%m-%d-%H%M%S')"
+KST_DATETIME="$(TZ='Asia/Seoul' date '+%Y-%m-%d-%H-%M-%S')"
 KST_TIME="$(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M:%S %Z')"
 START_EPOCH="$(date '+%s')"
 
@@ -216,7 +229,13 @@ fi
 # can use: they execute under `bash -c`, where the parent's shell functions are
 # not in scope. A conclusion drawn from the journal whose supporting evidence
 # came from a wrapped dmesg is worse than either source alone.
-KLOG_CMD='{ _j="$(journalctl -k -b 0 --no-pager 2>/dev/null)"; case "$_j" in ""|*"No entries"*) dmesg -T 2>/dev/null || dmesg 2>/dev/null;; *) printf "%s\\n" "$_j";; esac; }'
+KLOG_CMD='{
+    _j="$(journalctl -k -b 0 --no-pager 2>/dev/null)"
+    case "$_j" in
+        ""|*"No entries"*) dmesg -T 2>/dev/null || dmesg 2>/dev/null ;;
+        *)                 printf "%s\\n" "$_j" ;;
+    esac
+}'
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -599,24 +618,43 @@ collect_host_validation() {
         log "$output"
         status_ok
     else
-        begin "validate_host.sh (downloaded)" "fetch + run validate_host.sh"
+        begin "validate_host.sh (fetched)" "fetch + run validate_host.sh at $VALIDATE_HOST_REV"
         local tmp_script
-        tmp_script="$(mktemp /tmp/validate_host_XXXXXX.sh)"
-        if command -v wget >/dev/null 2>&1; then
-            wget -q -O "$tmp_script" \
-                "https://raw.githubusercontent.com/xcena-dev/public_sdk_release/refs/heads/main/scripts/validate_host.sh" 2>/dev/null || true
-        elif command -v curl >/dev/null 2>&1; then
-            curl -fsSL -o "$tmp_script" \
-                "https://raw.githubusercontent.com/xcena-dev/public_sdk_release/refs/heads/main/scripts/validate_host.sh" 2>/dev/null || true
+        # An unchecked mktemp leaves this empty, and the download below would
+        # then write to /scripts/... as root.
+        if ! tmp_script="$(mktemp /tmp/validate_host_XXXXXX.sh)" || [ -z "$tmp_script" ]; then
+            log "(mktemp failed — cannot fetch validate_host.sh)"
+            status_skip
+            return 0
         fi
 
-        if [ -s "$tmp_script" ]; then
+        local url="https://raw.githubusercontent.com/xcena-dev/public_sdk_release"
+        url="$url/$VALIDATE_HOST_REV/scripts/validate_host.sh"
+        log "Fetching: $url"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL -o "$tmp_script" "$url" 2>/dev/null || true
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -O "$tmp_script" "$url" 2>/dev/null || true
+        fi
+
+        # "Non-empty" is not evidence that we got the right thing: a proxy that
+        # answers 200 with an HTML notice passes that test. Check that it at
+        # least looks like the script we asked for before running it as root.
+        if [ -s "$tmp_script" ] \
+           && head -1 "$tmp_script" | grep -q '^#!/bin/bash' \
+           && grep -q 'XCENA Host Environment Validation' "$tmp_script"; then
             local output
             output="$($TIMEOUT bash "$tmp_script" 2>&1)" || true
             log "$output"
             status_ok
+        elif [ -s "$tmp_script" ]; then
+            log "(downloaded content is not validate_host.sh — not executed.)"
+            log "(A proxy or captive portal may have answered instead. First line:)"
+            log "  $(head -1 "$tmp_script" | cut -c1-100)"
+            status_fail
         else
             log "(failed to download validate_host.sh — offline host?)"
+            log "(Place validate_host.sh next to this script to skip the download.)"
             status_fail
         fi
         rm -f "$tmp_script"
@@ -831,7 +869,9 @@ collect_versions() {
     status_ok
 
     run_sh "XCENA / CXL related packages" \
-           "dpkg -l 2>/dev/null | grep -Ei 'libpxl|xcena|ndctl|daxctl|cxl|pciutils|numactl|acpica|dmidecode' || echo '(dpkg unavailable or no matching packages)'"
+           "dpkg -l 2>/dev/null \
+              | grep -Ei 'libpxl|xcena|ndctl|daxctl|cxl|pciutils|numactl|acpica|dmidecode' \
+              || echo '(dpkg unavailable or no matching packages)'"
 
     # The mx_dma driver version is what tells a version-mismatch apart from a
     # real failure; validate_host.sh only checks that the module is loaded.
@@ -956,7 +996,9 @@ collect_kernel() {
     # on a multi-socket host it matches hundreds of ordinary boot lines and
     # buries the CXL ones this view exists to surface.
     run_sh "dmesg - filtered highlights" \
-           "$KLOG_CMD | grep -iE 'cxl|dax|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error|hardware error' || echo '(no matching lines)'"
+           "$KLOG_CMD \
+              | grep -iE 'cxl|dax|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error' \
+              || echo '(no matching lines)'"
 
     # The dmesg ring buffer only holds the current boot and can wrap. If the
     # host rebooted after the incident, the interesting log is in the previous
@@ -992,7 +1034,9 @@ collect_runtime() {
             systemctl status pxl_resourced --no-pager -l
     run_cmd "pxl_resourced unit file" systemctl cat pxl_resourced
     run_sh "pxl_resourced journal (last 7 days)" \
-           "journalctl -u pxl_resourced.service --since '7 days ago' -o short-precise --no-pager -n 5000 2>&1 || echo '(journald unavailable)'"
+           "journalctl -u pxl_resourced.service --since '7 days ago' \
+                       -o short-precise --no-pager -n 5000 2>&1 \
+              || echo '(journald unavailable)'"
 
     local pxl_history="/tmp/pxl/history.log"
     dump_file "pxl_resourced history.log" "$pxl_history" 500
@@ -1051,7 +1095,11 @@ collect_runtime() {
     # SELinux/AppArmor can silently deny access to /dev/dax*.
     run_sh "Mandatory access control (SELinux / AppArmor)" \
            "if command -v getenforce >/dev/null 2>&1; then echo \"SELinux: \$(getenforce)\"; else echo 'SELinux: (not installed)'; fi
-            if command -v aa-status >/dev/null 2>&1; then echo; echo '[AppArmor]'; aa-status 2>&1 | head -20; else echo 'AppArmor: (aa-status not installed)'; fi"
+            if command -v aa-status >/dev/null 2>&1; then
+                echo; echo '[AppArmor]'; aa-status 2>&1 | head -20
+            else
+                echo 'AppArmor: (aa-status not installed)'
+            fi"
 
     # Only admin-installed rules, plus vendor rules whose *filename* names the
     # subsystem. A blind content grep pulls in unrelated files (for example
@@ -1073,7 +1121,11 @@ collect_runtime() {
             exit 0"
 
     run_sh "Recent core dumps" \
-           "if command -v coredumpctl >/dev/null 2>&1; then coredumpctl list --no-pager 2>&1 | tail -30; else echo '(coredumpctl not available)'; fi
+           "if command -v coredumpctl >/dev/null 2>&1; then
+                coredumpctl list --no-pager 2>&1 | tail -30
+            else
+                echo '(coredumpctl not available)'
+            fi
             echo; echo \"core_pattern: \$(cat /proc/sys/kernel/core_pattern 2>/dev/null)\""
 }
 
@@ -1231,7 +1283,9 @@ collect_cxl() {
             fi"
 
     run_sh "CXL tracepoints available" \
-           "ls /sys/kernel/tracing/events/cxl/ 2>/dev/null || ls /sys/kernel/debug/tracing/events/cxl/ 2>/dev/null || echo '(cxl tracepoints not available)'"
+           "ls /sys/kernel/tracing/events/cxl/ 2>/dev/null \
+              || ls /sys/kernel/debug/tracing/events/cxl/ 2>/dev/null \
+              || echo '(cxl tracepoints not available)'"
 
     # ---- ACPI tables --------------------------------------------------------
     # CEDT alone is not enough: whether CXL memory becomes a NUMA node is
@@ -1533,7 +1587,9 @@ collect_pcie() {
             fi"
 
     run_sh "AER / PCIe errors in kernel log" \
-           "$KLOG_CMD | grep -iE 'aer|pcie bus error|corrected error|uncorrectable|Malformed TLP|Bad TLP|Surprise Down' || echo '(no PCIe error messages)'"
+           "$KLOG_CMD \
+              | grep -iE 'aer|pcie bus error|corrected error|uncorrectable|Malformed TLP|Bad TLP' \
+              || echo '(no PCIe error messages)'"
 
     # Dump the whole path, not just the endpoint: the root port carries its own
     # CXL DVSEC and AER configuration, and a problem there presents as an
@@ -2079,7 +2135,8 @@ redact_report() {
 
     sed_pass "labelled identity fields" \
         -e 's/\b\([0-9A-Fa-f]\{2\}:\)\{5\}[0-9A-Fa-f]\{2\}\b/<mac-redacted>/g' \
-        -e '/version\|revision\|^ii \|^rc \|dpkg\|vermagic\|fw=\|firmware/I! s/\b\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}\([^-.0-9A-Za-z]\|$\)/<ipv4-redacted>\2/g' \
+        -e "/version\\|revision\\|^ii \\|^rc \\|dpkg\\|vermagic\\|fw=\\|firmware/I!\
+s/\\b\\([0-9]\\{1,3\\}\\.\\)\\{3\\}[0-9]\\{1,3\\}\\([^-.0-9A-Za-z]\\|\$\\)/<ipv4-redacted>\\2/g" \
         -e 's/^\([[:space:]]*Machine ID:\).*/\1 <redacted>/' \
         -e 's/^\([[:space:]]*Serial Number:\).*/\1 <redacted>/' \
         -e 's/^\([[:space:]]*UUID:\).*/\1 <redacted>/' \
@@ -2212,8 +2269,13 @@ if [ -n "${SUDO_USER:-}" ] && [ "$(id -u)" -eq 0 ]; then
     [ -n "$ARCHIVE" ] && chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$ARCHIVE" 2>/dev/null || true
 fi
 
-printf "\n${C_BOLD}  Done.${C_RESET}  collected OK=${C_GREEN}%d${C_RESET}  FAIL=${C_RED}%d${C_RESET}  SKIP=${C_YELLOW}%d${C_RESET}  (%ds)\n" \
-    "$OK_COUNT" "$FAIL_COUNT" "$SKIP_COUNT" "$ELAPSED"
+# Build the format in a variable rather than splitting it across printf
+# arguments: printf reuses its format for every remaining argument, so a split
+# format prints the line once per argument group.
+_done_fmt="\n${C_BOLD}  Done.${C_RESET}  collected"
+_done_fmt="${_done_fmt} OK=${C_GREEN}%d${C_RESET}  FAIL=${C_RED}%d${C_RESET}"
+_done_fmt="${_done_fmt}  SKIP=${C_YELLOW}%d${C_RESET}  (%ds)\n"
+printf "$_done_fmt" "$OK_COUNT" "$FAIL_COUNT" "$SKIP_COUNT" "$ELAPSED"
 if [ "$ANALYSIS_WARNS" -gt 0 ] || [ "$ANALYSIS_NOTES" -gt 0 ]; then
     printf "  Summary: ${C_YELLOW}%d WARN${C_RESET}, ${C_CYAN}%d NOTE${C_RESET} — see the Summary section above\n" \
         "$ANALYSIS_WARNS" "$ANALYSIS_NOTES"
