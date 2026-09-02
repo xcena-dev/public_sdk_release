@@ -113,10 +113,10 @@ collect_host_validation() {
         tmp_script="$(mktemp /tmp/validate_host_XXXXXX.sh)"
         if command -v wget >/dev/null 2>&1; then
             wget -q -O "$tmp_script" \
-                "https://raw.githubusercontent.com/metisx-dev/public_sdk_release/refs/heads/main/scripts/validate_host.sh" 2>/dev/null || true
+                "https://raw.githubusercontent.com/xcena-dev/public_sdk_release/refs/heads/main/scripts/validate_host.sh" 2>/dev/null || true
         elif command -v curl >/dev/null 2>&1; then
             curl -fsSL -o "$tmp_script" \
-                "https://raw.githubusercontent.com/metisx-dev/public_sdk_release/refs/heads/main/scripts/validate_host.sh" 2>/dev/null || true
+                "https://raw.githubusercontent.com/xcena-dev/public_sdk_release/refs/heads/main/scripts/validate_host.sh" 2>/dev/null || true
         fi
 
         if [ -s "$tmp_script" ]; then
