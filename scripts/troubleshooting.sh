@@ -2,7 +2,7 @@
 # troubleshooting.sh — XCENA debugging information collector
 #
 # Collects detailed diagnostic data for troubleshooting XCENA host issues.
-# Output is saved to troubleshooting_report_YYYY-MM-DD-HH-MM.log (KST timezone)
+# Output is saved to troubleshooting_report_YYYY-MM-DD-HHMMSS.log (KST timezone)
 # and packaged into a .tar.gz alongside it.
 #
 # Usage:
@@ -97,11 +97,22 @@ if [ "$(id -u)" -ne 0 ]; then
             # mistyped password still leaves the user with a partial report
             # instead of nothing at all. Preserve PATH so xcena_cli / xtop /
             # cxl stay reachable under sudo's secure_path.
-            if sudo -E env "PATH=$PATH" XCENA_TS_REEXEC=1 \
-                    bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}; then
-                exit 0
-            fi
-            printf "\n  [WARN] sudo re-execution failed; continuing without root.\n" >&2
+            sudo -E env "PATH=$PATH" XCENA_TS_REEXEC=1 \
+                bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+            _child_rc=$?
+            # Distinguish "sudo could not run us" from "we ran and reported a
+            # problem". Only sudo's own failures (auth denied, cannot execute)
+            # fall through to the degraded run; anything else is the child's own
+            # exit status and must be propagated, or a child that exits non-zero
+            # makes the parent collect the whole report a second time as non-root.
+            case "$_child_rc" in
+                1|126|127)
+                    printf "\n  [WARN] sudo re-execution failed; continuing without root.\n" >&2
+                    ;;
+                *)
+                    exit "$_child_rc"
+                    ;;
+            esac
         fi
     fi
 
@@ -157,9 +168,13 @@ if ! : > "$REPORT_FILE" 2>/dev/null; then
         printf "  [FATAL] cannot create a working directory. Aborting.\n" >&2
         exit 1
     fi
-    # mktemp -d creates the directory 0700 root-owned; without this the invoking
-    # user cannot even traverse into it once sudo exits.
-    chmod 755 "$_fallback_dir" 2>/dev/null || true
+    # mktemp -d creates the directory 0700 root-owned, which the invoking user
+    # cannot traverse once sudo exits. Hand it over rather than widening the
+    # mode: the report inside carries serials, machine-id and the PCI inventory,
+    # and 0755 would expose all of that to every local account.
+    if [ -n "${SUDO_UID:-}" ]; then
+        chown "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$_fallback_dir" 2>/dev/null || true
+    fi
     REPORT_FILE="${_fallback_dir}/${REPORT_NAME}"
     if ! : > "$REPORT_FILE" 2>/dev/null; then
         printf "  [FATAL] cannot create a report file. Aborting.\n" >&2
@@ -196,6 +211,12 @@ else
     TIMEOUT=""
     TO2=""
 fi
+
+# Same journal-first source as kernel_log_boot, as a string the run_sh payloads
+# can use: they execute under `bash -c`, where the parent's shell functions are
+# not in scope. A conclusion drawn from the journal whose supporting evidence
+# came from a wrapped dmesg is worse than either source alone.
+KLOG_CMD='{ _j="$(journalctl -k -b 0 --no-pager 2>/dev/null)"; case "$_j" in ""|*"No entries"*) dmesg -T 2>/dev/null || dmesg 2>/dev/null;; *) printf "%s\\n" "$_j";; esac; }'
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -325,8 +346,15 @@ run_opt() {
     if [ "$rc" -eq 0 ]; then
         if [ -n "$output" ]; then log "$output"; else log "(no output)"; fi
         status_ok
+    elif [ "$rc" -eq 124 ]; then
+        # A hang is never a "the tool is too old" result — it is the wedged
+        # device this collector exists to catch, and it must reach FAILED_ITEMS.
+        log "(TIMED OUT after ${CMD_TIMEOUT}s — the device or driver may be wedged)"
+        [ -n "$output" ] && log "$output"
+        status_fail
     else
-        log "(not supported by this build of $1 — exit code $rc)"
+        log "(exit code $rc — this build of $1 may not support the option, or the"
+        log " device rejected the command; see the output below)"
         [ -n "$output" ] && log "$output"
         status_skip
     fi
@@ -841,6 +869,8 @@ collect_versions() {
 collect_kernel() {
     section "Kernel"
 
+    kernel_log_load
+
     dump_file "Boot parameters" /proc/cmdline
 
     # A custom or vendor kernel missing a CONFIG_CXL_* option explains a whole
@@ -880,7 +910,7 @@ collect_kernel() {
             done | head -60
             echo
             echo '[kernel messages]'
-            { dmesg 2>/dev/null; } | grep -iE 'iommu|dmar|swiotlb' | head -40
+            $KLOG_CMD | grep -iE 'iommu|dmar|swiotlb' | head -40
             echo '(end of iommu messages)'"
 
     run_cmd "Loaded modules (lsmod)" lsmod
@@ -894,7 +924,8 @@ collect_kernel() {
         log " previous warning/oops. Decode: see Documentation/admin-guide/tainted-kernels)"
         log ""
         log "[taint-related kernel messages]"
-        dmesg 2>/dev/null | grep -iE 'taint|oops|BUG:|WARNING:|call trace' | tail -n 60 >> "$REPORT_FILE" 2>&1
+        kernel_log_boot | grep -iE 'taint|oops|BUG:|WARNING:|call trace' \
+            | tail -n 60 >> "$REPORT_FILE" 2>&1
     fi
     status_ok
 
@@ -925,7 +956,7 @@ collect_kernel() {
     # on a multi-socket host it matches hundreds of ordinary boot lines and
     # buries the CXL ones this view exists to surface.
     run_sh "dmesg - filtered highlights" \
-           "{ dmesg -T 2>/dev/null || dmesg 2>/dev/null; } | grep -iE 'cxl|dax|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error|hardware error' || echo '(no matching lines)'"
+           "$KLOG_CMD | grep -iE 'cxl|dax|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error|hardware error' || echo '(no matching lines)'"
 
     # The dmesg ring buffer only holds the current boot and can wrap. If the
     # host rebooted after the incident, the interesting log is in the previous
@@ -955,7 +986,7 @@ collect_runtime() {
         status_skip
     fi
     run_sh "mx_dma kernel messages" \
-           "{ dmesg -T 2>/dev/null || dmesg 2>/dev/null; } | grep -i mx_dma || echo '(no mx_dma messages)'"
+           "$KLOG_CMD | grep -i mx_dma || echo '(no mx_dma messages)'"
 
     run_cmd "pxl_resourced service status" \
             systemctl status pxl_resourced --no-pager -l
@@ -1343,6 +1374,8 @@ pci_link_info() {
 collect_pcie() {
     section "PCIe"
 
+    kernel_log_load
+
     run_cmd "PCI topology tree" lspci -tvnn
     run_cmd "All PCI devices" lspci -Dnn
 
@@ -1465,8 +1498,7 @@ collect_pcie() {
     if [ "$aer_found" -eq 1 ]; then status_ok; else log "(no AER counters exposed)"; status_skip; fi
 
     run_sh "ACPI _OSC negotiation (who owns error reporting)" \
-           "kernel_log_boot_dump() { journalctl -k -b 0 --no-pager 2>/dev/null || dmesg 2>/dev/null; }
-            kernel_log_boot_dump | grep -E '_OSC|firmware first mode' | sed 's/^\\[[^]]*\\] //' | sort -u
+           "$KLOG_CMD | grep -E '_OSC|firmware first mode' | sed 's/^\\[[^]]*\\] //' | sort -u
             echo '(end of _OSC negotiation)'"
 
     # ASPM is the other reason a link legitimately sits below its maximum.
@@ -1487,7 +1519,7 @@ collect_pcie() {
     # so collect the GHES side explicitly — otherwise the report shows an
     # all-zero AER table and nothing else.
     run_sh "GHES / APEI error records" \
-           "{ dmesg 2>/dev/null; } | grep -iE 'ghes|apei|hest|erst|einj' || echo '(no GHES/APEI messages)'"
+           "$KLOG_CMD | grep -iE 'ghes|apei|hest|erst|einj' || echo '(no GHES/APEI messages)'"
 
     # ...and the authoritative log for those errors is the BMC's event log.
     run_sh "BMC / IPMI system event log" \
@@ -1501,7 +1533,7 @@ collect_pcie() {
             fi"
 
     run_sh "AER / PCIe errors in kernel log" \
-           "{ dmesg -T 2>/dev/null || dmesg 2>/dev/null; } | grep -iE 'aer|pcie bus error|corrected error|uncorrectable|Malformed TLP|Bad TLP|Surprise Down' || echo '(no PCIe error messages)'"
+           "$KLOG_CMD | grep -iE 'aer|pcie bus error|corrected error|uncorrectable|Malformed TLP|Bad TLP|Surprise Down' || echo '(no PCIe error messages)'"
 
     # Dump the whole path, not just the endpoint: the root port carries its own
     # CXL DVSEC and AER configuration, and a problem there presents as an
@@ -1551,17 +1583,31 @@ collect_pcie() {
 KERNEL_BOOT_LOG=""
 KERNEL_BOOT_LOG_LOADED=0
 
-kernel_log_boot() {
-    if [ "$KERNEL_BOOT_LOG_LOADED" -eq 0 ]; then
-        if command -v journalctl >/dev/null 2>&1 \
-           && journalctl -k -b 0 --no-pager -n 1 >/dev/null 2>&1; then
-            KERNEL_BOOT_LOG="$(journalctl -k -b 0 --no-pager 2>/dev/null)"
-        fi
-        if [ -z "$KERNEL_BOOT_LOG" ]; then
-            KERNEL_BOOT_LOG="$(dmesg 2>/dev/null)"
-        fi
-        KERNEL_BOOT_LOG_LOADED=1
+# Load the log into the global. Must be called directly, never inside a pipeline
+# or command substitution: those run in a subshell, where the assignment is
+# discarded and the "cache" silently reloads on every use.
+kernel_log_load() {
+    [ "$KERNEL_BOOT_LOG_LOADED" -eq 1 ] && return 0
+    KERNEL_BOOT_LOG_LOADED=1
+    if command -v journalctl >/dev/null 2>&1; then
+        local probe
+        probe="$(journalctl -k -b 0 --no-pager -n 1 2>/dev/null)"
+        # journalctl exits 0 and prints "-- No entries --" when the caller
+        # cannot read the journal, so the exit status alone is not a usable
+        # probe: it would hide the fact that we got nothing and skip dmesg.
+        case "$probe" in
+            ''|*'No entries'*) : ;;
+            *) KERNEL_BOOT_LOG="$(journalctl -k -b 0 --no-pager 2>/dev/null)" ;;
+        esac
     fi
+    if [ -z "$KERNEL_BOOT_LOG" ]; then
+        KERNEL_BOOT_LOG="$(dmesg 2>/dev/null)"
+    fi
+    return 0
+}
+
+kernel_log_boot() {
+    kernel_log_load
     printf '%s\n' "$KERNEL_BOOT_LOG"
 }
 
@@ -1580,6 +1626,8 @@ kernel_log_reaches_boot() {
 #   OK   - observed and unremarkable
 #   NOTE - worth a human's eye, but a legitimate configuration
 #   WARN - likely to mislead or to block something
+#   --   - not determined (a tool was missing, or the data was unavailable);
+#          never a judgement about the host
 # ===========================================================================
 ANALYSIS_NOTES=0
 ANALYSIS_WARNS=0
@@ -1632,6 +1680,10 @@ slot_for_bdf() {
 collect_analysis() {
     section "Summary"
 
+    # Load once here, outside any pipeline, so the checks below read a
+    # cached copy instead of re-running journalctl on each one.
+    kernel_log_load
+
     # ---- device chain ---------------------------------------------------
     a_head "device chain"
 
@@ -1670,13 +1722,14 @@ collect_analysis() {
         # memdev/ram/size since ~6.8), so use the tool first and fall back.
         ram=""
         if command -v cxl >/dev/null 2>&1; then
-            ram="$(cxl list -M -u 2>/dev/null \
+            # Scope to this memdev: unscoped, every row on a multi-device host
+            # printed device 0's size.
+            ram="$(cxl list -m "$mem" -M -u 2>/dev/null \
                    | grep -oP '"ram_size":"\K[^"]+' | head -1)"
         fi
         if [ -z "$ram" ]; then
             ram_bytes=""
-            for szf in "$memdir/ram/size" "$memdir/ram_size" \
-                       /sys/bus/cxl/devices/endpoint*/decoder*.0/dpa_size; do
+            for szf in "$memdir/ram/size" "$memdir/ram_size"; do
                 [ -f "$szf" ] || continue
                 ram_bytes="$(sysread "$szf")"
                 [ -n "$ram_bytes" ] && break
@@ -1686,8 +1739,15 @@ collect_analysis() {
             # Guard the pattern strictly: `$(( ))` on a non-numeric string
             # prints "value too great for base" to the terminal before any
             # redirection applies, corrupting the progress column.
+            # A digit-leading hex token like "12ab" passed the old guard, and
+            # $(( )) then failed with "value too great for base" — an expansion
+            # error, which unwinds out of this function and silently truncates
+            # the rest of the Summary. Accept 0x-hex or plain decimal, nothing
+            # else.
             case "${ram_bytes:-}" in
-                0x*[!0-9a-fA-F]*|*[!0-9a-fA-FxX]*) ram_bytes="" ;;
+                0x*[!0-9a-fA-F]*) ram_bytes="" ;;
+                0x*)              : ;;
+                *[!0-9]*)         ram_bytes="" ;;
             esac
             case "${ram_bytes:-}" in
                 0x*|[0-9]*)
@@ -1984,7 +2044,10 @@ local filesystem sizes and mount points|kept"
     if [ "$REDACT_MODE" -eq 1 ]; then
         log ""
         log "  Redaction was applied (--redact). Free-text kernel logs may still"
-        log "  carry identifying strings that no pattern can catch."
+        log "  carry identifying strings that no pattern can catch. IP addresses"
+        log "  on lines that also mention a version or firmware are left alone,"
+        log "  because a four-part version number is indistinguishable from an"
+        log "  IP and destroying it would break the diagnosis."
     else
         log ""
         log "  Re-run with --redact to mask the rows marked above."
@@ -2016,7 +2079,7 @@ redact_report() {
 
     sed_pass "labelled identity fields" \
         -e 's/\b\([0-9A-Fa-f]\{2\}:\)\{5\}[0-9A-Fa-f]\{2\}\b/<mac-redacted>/g' \
-        -e '/[Vv]ersion\|Revision\|^ii \|^rc \|dpkg\|vermagic/! s/\b\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}\b/<ipv4-redacted>/g' \
+        -e '/version\|revision\|^ii \|^rc \|dpkg\|vermagic\|fw=\|firmware/I! s/\b\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}\([^-.0-9A-Za-z]\|$\)/<ipv4-redacted>\2/g' \
         -e 's/^\([[:space:]]*Machine ID:\).*/\1 <redacted>/' \
         -e 's/^\([[:space:]]*Serial Number:\).*/\1 <redacted>/' \
         -e 's/^\([[:space:]]*UUID:\).*/\1 <redacted>/' \
@@ -2119,8 +2182,10 @@ if [ "$REDACT_MODE" -eq 1 ]; then
         # Rename so the filename cannot assert something the content does not,
         # and skip the archive entirely: a customer who mails the .tar.gz should
         # never be able to do so believing it was masked.
+        # Strip the misleading _redacted tag wherever it sits — a non-root run
+        # appends _INCOMPLETE after it, so a plain suffix strip does not reach it.
         _failed_name="${REPORT_FILE%.log}"
-        _failed_name="${_failed_name%_redacted}_REDACTION_FAILED.log"
+        _failed_name="${_failed_name/_redacted/}_REDACTION_FAILED.log"
         if mv "$REPORT_FILE" "$_failed_name" 2>/dev/null; then
             REPORT_FILE="$_failed_name"
         fi
@@ -2172,4 +2237,8 @@ if [ "$PRIV_LEVEL" != "root" ]; then
 fi
 printf "\n"
 
+# A wrapper or CI job must be able to tell that the report is not safe to send.
+if [ "$REDACT_FAILED" -eq 1 ]; then
+    exit 3
+fi
 exit 0
