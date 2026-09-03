@@ -2,8 +2,7 @@
 # troubleshooting.sh — XCENA debugging information collector
 #
 # Collects detailed diagnostic data for troubleshooting XCENA host issues.
-# Output is saved to troubleshooting_report_YYYY-MM-DD-HH-MM-SS.log (KST timezone)
-# and packaged into a .tar.gz alongside it.
+# Output is saved to troubleshooting_report_YYYY-MM-DD-HH-MM-SS.log (KST timezone).
 #
 # Usage:
 #   sudo bash troubleshooting.sh          # recommended
@@ -46,21 +45,21 @@ VALIDATE_HOST_REV="6f8a84234850aa4518f0673332aea36e1fe019b7"
 # (and so an invalid option exits non-zero instead of being swallowed by
 # the re-exec fallback).
 FULL_MODE=0
-REDACT_MODE=0
+
+# Host-identifying fields are always masked. There is no opt-out, because none
+# of them answers a CXL question: hostname, machine-id, chassis and board
+# serials, account names, MAC and IP addresses. The unit under diagnosis is
+# identified by the CXL device's own serial, which is kept, as are the BIOS
+# version, board model and slot labels a diagnosis actually turns on. Without a
+# flag there is no path by which an unmasked report reaches us by accident.
 
 usage() {
     cat <<'USAGE'
-Usage: sudo bash troubleshooting.sh [--full] [--redact]
+Usage: sudo bash troubleshooting.sh [--full]
 
   --full     Collect everything unsummarised. Default mode summarises a few
              very large, low-signal sources; this disables that. The report
              grows several times larger.
-  --redact   Mask host-identifying fields before archiving: MAC and IP
-             addresses, machine-id, chassis/board/DIMM serials, UUIDs, asset
-             tags, the hostname and account names. The CXL device's own serial
-             is never masked — it identifies the unit under diagnosis. Best
-             effort only: free-text kernel logs may still carry identifying
-             strings.
   -h, --help Show this message.
 
 The script re-executes itself under sudo when not run as root: dmesg,
@@ -76,7 +75,6 @@ ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --full)    FULL_MODE=1 ;;
-        --redact)  REDACT_MODE=1 ;;
         -h|--help) usage; exit 0 ;;
         *)         printf "unknown option: %s\n\n" "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -159,7 +157,6 @@ START_EPOCH="$(date '+%s')"
 
 _full_tag=""
 [ "$FULL_MODE" -eq 1 ] && _full_tag="_full"
-[ "$REDACT_MODE" -eq 1 ] && _full_tag="${_full_tag}_redacted"
 if [ "$PRIV_LEVEL" = "root" ]; then
     REPORT_NAME="troubleshooting_report_${KST_DATETIME}${_full_tag}.log"
 else
@@ -581,7 +578,7 @@ if [ "$FULL_MODE" -eq 1 ]; then
 else
     log "Mode      : default (some large sources summarised; --full for raw)"
 fi
-[ "$REDACT_MODE" -eq 1 ] && log "Redaction : ON (host-identifying fields masked)"
+log "Masking   : host-identifying fields are masked"
 log "Script    : ${BASH_SOURCE[0]:-<stdin>}"
 if [ "$PRIV_LEVEL" != "root" ]; then
     log ""
@@ -2074,41 +2071,37 @@ collect_analysis() {
 # Tell the reader plainly what identifying data the report carries, so whoever
 # has to approve sending it can check rather than guess.
 report_data_inventory() {
-    a_head "host-identifying data in this report"
+    a_head "host-identifying data"
 
-    # Two different things: what identifies the machine, and what --redact can
-    # actually mask. Listing them together invites the reader to assume the
-    # option covers everything, so mark each row.
-    local rows="hostname, machine-id|masked by --redact
-chassis / board / CPU serial numbers, UUIDs, asset tags|masked by --redact
-account names of the invoking and logged-in users|masked by --redact
-MAC addresses (from the kernel log, not collected directly)|masked by --redact
+    # State what happened to each field, not what an option could do to it: the
+    # reader's question is "what is in the file I am about to send".
+    local rows="hostname, machine-id|MASKED
+chassis / board / CPU serial numbers, UUIDs, asset tags|MASKED
+account names of the invoking and logged-in users|MASKED
+MAC and IP addresses (from the kernel log)|MASKED
 BIOS vendor, version and date|kept — needed for diagnosis
 system / baseboard manufacturer and product name|kept — needed for diagnosis
 physical slot labels and slot inventory|kept — needed for diagnosis
+CXL device serial number and firmware version|kept — identifies the unit
 full PCI device inventory (all installed hardware)|kept
 local filesystem sizes and mount points|kept"
 
     local label where
-    log "  Review before sharing outside your organisation."
-    printf "  %s\n" "Review before sharing outside your organisation."
+    log "  Host-identifying fields were masked before this report was written."
+    printf "  %s\n" "Host-identifying fields were masked before this report was written."
+
     printf '%s\n' "$rows" | while IFS='|' read -r label where; do
-        log "$(printf '    %-58s %s' "$label" "$where")"
-        printf "    %-58s %s\n" "$label" "$where"
+        log "$(printf '    %-56s %s' "$label" "$where")"
+        printf "    %-56s %s\n" "$label" "$where"
     done
 
-    if [ "$REDACT_MODE" -eq 1 ]; then
-        log ""
-        log "  Redaction was applied (--redact). Free-text kernel logs may still"
-        log "  carry identifying strings that no pattern can catch. IP addresses"
-        log "  on lines that also mention a version or firmware are left alone,"
-        log "  because a four-part version number is indistinguishable from an"
-        log "  IP and destroying it would break the diagnosis."
-    else
-        log ""
-        log "  Re-run with --redact to mask the rows marked above."
-        printf "\n    %s\n" "Re-run with --redact to mask the rows marked above."
-    fi
+    log ""
+    log "  Masking is best effort. Free-text kernel logs may still carry"
+    log "  identifying strings — an internal hostname mentioned by an"
+    log "  application, a custom path — that no pattern can recognise."
+    log "  IP addresses on lines that also mention a version or firmware are"
+    log "  left alone, because a four-part version number is indistinguishable"
+    log "  from an IP and destroying it would break the diagnosis."
 }
 
 # Best-effort masking. Targets labelled fields and well-formed addresses rather
@@ -2226,47 +2219,27 @@ fi
 # it would make the terminal total disagree with the total inside the report.
 
 # ---------------------------------------------------------------------------
-# Redaction (before archiving, so the archive matches the log)
+# Masking
 # ---------------------------------------------------------------------------
-REDACT_MSG=""
 REDACT_FAILED=0
-if [ "$REDACT_MODE" -eq 1 ]; then
-    if redact_report; then
-        REDACT_MSG="applied"
-    else
-        REDACT_FAILED=1
-        REDACT_MSG="FAILED — the report still contains identifying data"
-        # Rename so the filename cannot assert something the content does not,
-        # and skip the archive entirely: a customer who mails the .tar.gz should
-        # never be able to do so believing it was masked.
-        # Strip the misleading _redacted tag wherever it sits — a non-root run
-        # appends _INCOMPLETE after it, so a plain suffix strip does not reach it.
-        _failed_name="${REPORT_FILE%.log}"
-        _failed_name="${_failed_name/_redacted/}_REDACTION_FAILED.log"
-        if mv "$REPORT_FILE" "$_failed_name" 2>/dev/null; then
-            REPORT_FILE="$_failed_name"
-        fi
+if ! redact_report; then
+    REDACT_FAILED=1
+    # Rename so the filename cannot assert something the content does not.
+    _failed_name="${REPORT_FILE%.log}_MASKING_FAILED.log"
+    if mv "$REPORT_FILE" "$_failed_name" 2>/dev/null; then
+        REPORT_FILE="$_failed_name"
     fi
 fi
 
 # ---------------------------------------------------------------------------
-# Package the report
+# Hand the report to the invoking user
+#
+# No archive is produced. The report is plain text that compresses well, and a
+# customer who wants it smaller will compress it themselves; shipping a second
+# file only creates a way to send the wrong one.
 # ---------------------------------------------------------------------------
-ARCHIVE="${REPORT_FILE%.log}.tar.gz"
-if [ "$REDACT_FAILED" -eq 1 ]; then
-    ARCHIVE=""
-    ARCHIVE_MSG="(not created — redaction failed; see the warning below)"
-elif tar czf "$ARCHIVE" -C "$(dirname "$REPORT_FILE")" "$(basename "$REPORT_FILE")" 2>/dev/null; then
-    ARCHIVE_MSG="$ARCHIVE ($(du -h "$ARCHIVE" 2>/dev/null | cut -f1))"
-else
-    ARCHIVE=""
-    ARCHIVE_MSG="(archiving failed)"
-fi
-
-# Make the report readable/removable by the invoking user after sudo re-exec.
 if [ -n "${SUDO_USER:-}" ] && [ "$(id -u)" -eq 0 ]; then
     chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$REPORT_FILE" 2>/dev/null || true
-    [ -n "$ARCHIVE" ] && chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$ARCHIVE" 2>/dev/null || true
 fi
 
 # Build the format in a variable rather than splitting it across printf
@@ -2283,15 +2256,10 @@ else
     printf "  Summary: ${C_GREEN}nothing flagged${C_RESET}\n"
 fi
 printf "  Report : ${C_CYAN}%s${C_RESET} (%s)\n" "$REPORT_FILE" "$(du -h "$REPORT_FILE" 2>/dev/null | cut -f1)"
-printf "  Archive: ${C_CYAN}%s${C_RESET}\n" "$ARCHIVE_MSG"
-if [ -n "$REDACT_MSG" ]; then
-    if [ "$REDACT_FAILED" -eq 1 ]; then
-        printf "\n  ${C_RED}${C_BOLD}REDACTION FAILED.${C_RESET} %s\n" \
-               "The report was NOT masked and no archive was created."
-        printf "  ${C_YELLOW}Do not send this report until it has been reviewed by hand.${C_RESET}\n"
-    else
-        printf "  Redact : %s\n" "$REDACT_MSG"
-    fi
+if [ "$REDACT_FAILED" -eq 1 ]; then
+    printf "\n  ${C_RED}${C_BOLD}MASKING FAILED.${C_RESET} %s\n" \
+           "Host-identifying data is still in the report."
+    printf "  ${C_YELLOW}Do not send it until it has been reviewed by hand.${C_RESET}\n"
 fi
 if [ "$PRIV_LEVEL" != "root" ]; then
     printf "\n  ${C_RED}${C_BOLD}This report is INCOMPLETE (collected without root).${C_RESET}\n"

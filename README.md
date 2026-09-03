@@ -11,7 +11,7 @@ commands, which are themselves read-only operations.
 | Script | Purpose | Output |
 | --- | --- | --- |
 | [`scripts/validate_host.sh`](scripts/validate_host.sh) | Quick pass/fail check that the host is set up correctly | Terminal only |
-| [`scripts/troubleshooting.sh`](scripts/troubleshooting.sh) | Full diagnostic collection to send to XCENA support | `.log` + `.tar.gz` |
+| [`scripts/troubleshooting.sh`](scripts/troubleshooting.sh) | Full diagnostic collection to send to XCENA support | One `.log` file |
 
 ---
 
@@ -48,12 +48,15 @@ not look like the expected script. Bump `VALIDATE_HOST_REV` at the top of
 re-executes itself under `sudo` automatically; if that is not possible it still
 runs, but marks the report `_INCOMPLETE` so the recipient can tell at a glance.
 
-It writes two files to the current directory:
+It writes one file to the current directory:
 
 ```
-troubleshooting_report_YYYY-MM-DD-HH-MM-SS.log       full report
-troubleshooting_report_YYYY-MM-DD-HH-MM-SS.tar.gz    same, compressed — send this one
+troubleshooting_report_YYYY-MM-DD-HH-MM-SS.log
 ```
+
+Host-identifying fields are always masked; the report lists exactly what was
+masked and what was kept. Compress it yourself if you want it smaller — it is
+plain text and compresses to roughly a tenth of its size.
 
 ### Options
 
@@ -61,13 +64,10 @@ troubleshooting_report_YYYY-MM-DD-HH-MM-SS.tar.gz    same, compressed — send t
 | --- | --- |
 | *(none)* | Collects everything needed for a diagnosis. A few very large, low-signal sources are summarised. |
 | `--full` | No summarising. Use only if XCENA asks for it — the report grows several times larger. |
-| `--redact` | Masks host-identifying fields before archiving. See [Privacy](#privacy). |
 | `-h`, `--help` | Usage. |
 
-Options can be combined (`--full --redact`).
-
-On a 2-socket, 6-NUMA-node test server the default report is about 1.3 MB
-(150 KB compressed); `--full` is about 5.6 MB (320 KB compressed).
+On a 2-socket, 6-NUMA-node test server the default report is about 1.7 MB and
+`--full` about 6 MB. Both compress to roughly a tenth.
 
 ### What it collects
 
@@ -117,9 +117,11 @@ passes or fails a host.
 
 ## Privacy
 
-The report describes the machine it ran on. What matters for a diagnosis is
-kept in every mode; `--redact` masks only the fields that identify *whose*
-machine it is.
+The report describes the machine it ran on. Fields that identify *whose*
+machine it is are always masked — there is no option to disable it, because
+none of them answers a CXL question. Everything a diagnosis turns on is kept.
+The report ends with a table stating exactly what was masked and what was kept,
+so it can be reviewed rather than guessed at.
 
 **Always kept — these are what a diagnosis turns on:**
 
@@ -129,7 +131,7 @@ machine it is.
 - physical slot labels and per-slot CXL capability
 - the CXL device's serial number and firmware version
 
-**Masked by `--redact`:**
+**Always masked:**
 
 | Field | Where it comes from |
 | --- | --- |
@@ -142,10 +144,7 @@ MAC addresses are not collected deliberately — the script runs no network
 commands at all. They appear because the kernel logs a NIC's address when it
 probes the device, and the report includes the kernel log.
 
-The full list of identifying fields is printed at the end of every report, so
-it can be reviewed rather than guessed at.
-
-Redaction is best effort. Labelled fields and well-formed addresses are
+Masking is best effort. Labelled fields and well-formed addresses are
 handled, but free-text kernel logs may still contain identifying strings such
 as internal hostnames, application names or custom paths. If the hostname is
 too short or collides with terms used throughout the report, it is left
