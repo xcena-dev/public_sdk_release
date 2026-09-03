@@ -85,8 +85,9 @@ that produced it, so any result can be reproduced by hand.
 | 7 | CXL Subsystem | Full `cxl list` topology, **device health / partition / alert configuration**, every CXL sysfs attribute *value*, CDAT, debugfs, and the CEDT, SRAT, HMAT, SLIT, MCFG and HEST ACPI tables |
 | 8 | DAX | `daxctl` regions and devices, sysfs attributes, `devdax` mode check |
 | 9 | Device Firmware | `xcena_cli device-info` and `fw-info` per device |
-| 10 | PCIe | Topology tree, device discovery, **physical slot of each CXL device**, **link speed/width from endpoint to root port**, AER counters, ASPM policy, ACPI `_OSC` negotiation, GHES records, BMC/IPMI event log, `lspci -vvv` and config space for the whole path |
-| 11 | Summary | Automated triage — see below |
+| 10 | InfiniteMemory SMART | `xcena_cli im get-smart -v` for each device reported as InfiniteMemory |
+| 11 | PCIe | Topology tree, device discovery, **physical slot of each CXL device**, **link speed/width from endpoint to root port**, AER counters, ASPM policy, ACPI `_OSC` negotiation, GHES records, BMC/IPMI event log, `lspci -vvv` and config space for the whole path |
+| 12 | Summary | Automated triage — see below |
 
 ### Summary section
 
