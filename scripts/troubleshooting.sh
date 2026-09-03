@@ -1062,9 +1062,12 @@ collect_runtime() {
     # full line also matches the user column and any argument that happens to
     # contain the pattern, which drags in unrelated processes — and a process's
     # arguments are exactly where credentials and internal paths show up.
+    # No user column: the owner of a process is not a CXL fact, and an arbitrary
+    # account name here cannot be masked by value the way the invoking user's
+    # can. PID, command and arguments are what diagnose a stuck daemon.
     run_sh "XCENA/PXL processes" \
-           "ps -eo pid,ppid,user,pcpu,pmem,rss,etime,stat,comm,args --no-headers 2>/dev/null \
-              | awk '\$9 ~ /^(pxl|xcena|xtop|mx_)/' \
+           "ps -eo pid,ppid,pcpu,pmem,rss,etime,stat,comm,args --no-headers 2>/dev/null \
+              | awk '\$8 ~ /^(pxl|xcena|xtop|mx_)/' \
               | head -40
             echo '(matched on executable name; empty means no XCENA process is running)'"
 
@@ -1072,7 +1075,9 @@ collect_runtime() {
     # DAX character device.
     run_sh "Holders of /dev/dax* and /dev/mx_dma*" \
            "if command -v lsof >/dev/null 2>&1; then
-                lsof /dev/dax* /dev/mx_dma/* 2>/dev/null || echo '(no open handles)'
+                lsof -F pcn /dev/dax* /dev/mx_dma/* 2>/dev/null \
+                  | sed 's/^c/  command: /; s/^p/PID /; s/^n/  path: /' \
+                  || echo '(no open handles)'
             else
                 echo '(lsof not installed)'
                 for p in /proc/[0-9]*/fd/*; do
@@ -2073,110 +2078,286 @@ collect_analysis() {
 report_data_inventory() {
     a_head "host-identifying data"
 
-    # State what happened to each field, not what an option could do to it: the
-    # reader's question is "what is in the file I am about to send".
-    local rows="hostname, machine-id|MASKED
-chassis / board / CPU serial numbers, UUIDs, asset tags|MASKED
-account names of the invoking and logged-in users|MASKED
-MAC and IP addresses (from the kernel log)|MASKED
-BIOS vendor, version and date|kept — needed for diagnosis
-system / baseboard manufacturer and product name|kept — needed for diagnosis
-physical slot labels and slot inventory|kept — needed for diagnosis
-CXL device serial number and firmware version|kept — identifies the unit
+    # Every status below was established by searching the finished report for
+    # the value itself, not by observing that a substitution ran.
+    local rows="hostname (all forms)|$MASK_STATE_HOST
+machine-id|$MASK_STATE_MID
+hardware serials, UUIDs, asset tags, account names, MAC/IP|$MASK_STATE_ID
+BIOS vendor, version and date|kept - needed for diagnosis
+system / baseboard manufacturer and product name|kept - needed for diagnosis
+physical slot labels and slot inventory|kept - needed for diagnosis
+CXL device serial number and firmware version|kept - identifies the unit
 full PCI device inventory (all installed hardware)|kept
 local filesystem sizes and mount points|kept"
 
-    local label where
-    log "  Host-identifying fields were masked before this report was written."
-    printf "  %s\n" "Host-identifying fields were masked before this report was written."
+    local failed=0
+    case "$MASK_STATE_HOST$MASK_STATE_MID$MASK_STATE_ID" in
+        *"NOT MASKED"*|*"NOT VERIFIED"*) failed=1 ;;
+    esac
 
+    local headline
+    if [ "$failed" -eq 0 ]; then
+        headline="Host-identifying fields were masked, and their absence was verified."
+        log "  $headline"
+        printf "  %s\n" "$headline"
+    else
+        headline="NOT FULLY MASKED - see the rows below."
+        log "  $headline"
+        printf "  ${C_RED}%s${C_RESET}\n" "$headline"
+    fi
+
+    local label where
     printf '%s\n' "$rows" | while IFS='|' read -r label where; do
         log "$(printf '    %-56s %s' "$label" "$where")"
         printf "    %-56s %s\n" "$label" "$where"
     done
 
     log ""
-    log "  Masking is best effort. Free-text kernel logs may still carry"
-    log "  identifying strings — an internal hostname mentioned by an"
-    log "  application, a custom path — that no pattern can recognise."
-    log "  IP addresses on lines that also mention a version or firmware are"
-    log "  left alone, because a four-part version number is indistinguishable"
-    log "  from an IP and destroying it would break the diagnosis."
+    log "  Verification searches this report for the values themselves, so a row"
+    log "  saying MASKED means the value is not in this file. It cannot cover"
+    log "  what it was never given: an internal hostname mentioned only inside"
+    log "  an application's log line, a custom path, an identifier in a format"
+    log "  no rule recognises. A quad directly introduced as a version or"
+    log "  firmware revision is left alone, because it is indistinguishable"
+    log "  from an IP address and removing it would break the diagnosis."
+
+    return "$failed"
 }
 
-# Best-effort masking. Targets labelled fields and well-formed addresses rather
-# than doing a broad search-and-replace, so the report stays diagnosable.
+# ---------------------------------------------------------------------------
+# Masking
 #
-# Every pass is checked. A report whose *name* says "redacted" while masking
-# silently failed is worse than no redaction at all, so any failure here is
-# fatal to the archive.
-redact_report() {
-    local host_name short_name mach_id rc=0
+# The report may only claim a field is masked when that field is verifiably
+# gone. Earlier versions inferred "MASKED" from "the substitution ran", which is
+# a different statement: it is still true when the pass was pointed at the wrong
+# value, when the value reached the report by a route no pass covers, or when
+# the pattern silently matched nothing. Every false claim found in review came
+# from that one inference.
+#
+# So: capture the concrete values before masking, substitute, then grep the
+# finished report for each of them. A row says MASKED only when the count is
+# zero. A pass that fails, skips, or simply misses all land in the same place.
+# ---------------------------------------------------------------------------
 
-    # sed_pass <description> <sed args...>
-    sed_pass() {
-        local what="$1"
-        shift
-        if ! sed -i "$@" "$REPORT_FILE" 2>/dev/null; then
-            log ""
-            log "REDACTION FAILURE: the '$what' pass did not complete."
-            rc=1
-            return 1
-        fi
-        return 0
-    }
+# Newline-separated sets of literal values that must not survive.
+MASK_VALUES_HOST=""
+MASK_VALUES_MID=""
+MASK_VALUES_ID=""
 
-    sed_pass "labelled identity fields" \
-        -e 's/\b\([0-9A-Fa-f]\{2\}:\)\{5\}[0-9A-Fa-f]\{2\}\b/<mac-redacted>/g' \
-        -e "/version\\|revision\\|^ii \\|^rc \\|dpkg\\|vermagic\\|fw=\\|firmware/I!\
-s/\\b\\([0-9]\\{1,3\\}\\.\\)\\{3\\}[0-9]\\{1,3\\}\\([^-.0-9A-Za-z]\\|\$\\)/<ipv4-redacted>\\2/g" \
-        -e 's/^\([[:space:]]*Machine ID:\).*/\1 <redacted>/' \
-        -e 's/^\([[:space:]]*Serial Number:\).*/\1 <redacted>/' \
-        -e 's/^\([[:space:]]*UUID:\).*/\1 <redacted>/' \
-        -e 's/^\([[:space:]]*Asset Tag:\).*/\1 <redacted>/' \
-        -e 's/SUDO_USER=[^ ]*/SUDO_USER=<redacted>/g' \
-        -e 's/uid=\([0-9]*\)([^)]*)/uid=\1(<redacted>)/g' \
-        -e 's/gid=\([0-9]*\)([^)]*)/gid=\1(<redacted>)/g' \
-        -e 's/\([0-9]\{1,7\}\)([a-z_][a-z0-9_-]*)/\1(<redacted>)/g'
+# Per-category outcome, filled in by mask_verify.
+MASK_STATE_HOST=""
+MASK_STATE_MID=""
+MASK_STATE_ID=""
 
-    # Hostnames reach the report both as the FQDN (header) and as the short name
-    # (every journal line), so substitute both, longest first. Any character
-    # that is live in a sed regex or in the s/// delimiter must be escaped, or
-    # the pass fails — silently, before this rewrite.
-    host_name="$(hostname 2>/dev/null)"
-    short_name="$(hostname -s 2>/dev/null)"
-    local n esc
-    for n in "$host_name" "$short_name"; do
-        [ -n "$n" ] || continue
-        case "$n" in
-            cxl|dax|mem|pci|numa|ram|dev|sys|root|node|test|host|server|linux)
-                log ""
-                log "NOTE: the hostname (\"$n\") collides with terms used throughout this"
-                log "      report, so it was left unmasked rather than risk corrupting"
-                log "      diagnostic output."
-                continue ;;
-        esac
-        if [ "${#n}" -lt 4 ]; then
-            log ""
-            log "NOTE: the hostname (\"$n\") is too short to substitute safely and was"
-            log "      left unmasked."
-            continue
-        fi
-        esc="$(printf '%s' "$n" | sed 's/[][\\.^$*/&]/\\&/g')"
-        sed_pass "hostname ($n)" "s/\b${esc}\b/<host-redacted>/g"
+# mask_add <set-name> <value>
+# Values shorter than 4 characters are refused: substituting them across a
+# report full of short tokens corrupts more than it protects.
+mask_add() {
+    local set_name="$1" v="$2"
+    [ -n "$v" ] || return 0
+    [ "${#v}" -ge 4 ] || return 0
+    case "$v" in *[!!-~]*) return 0 ;; esac      # printable, no whitespace
+    case "$set_name" in
+        host) case "$MASK_VALUES_HOST" in *"$v"$'\n'*) return 0 ;; esac
+              MASK_VALUES_HOST="${MASK_VALUES_HOST}${v}"$'\n' ;;
+        mid)  MASK_VALUES_MID="${MASK_VALUES_MID}${v}"$'\n' ;;
+        id)   case "$MASK_VALUES_ID" in *"$v"$'\n'*) return 0 ;; esac
+              MASK_VALUES_ID="${MASK_VALUES_ID}${v}"$'\n' ;;
+    esac
+}
+
+# The report acquires the hostname from more places than `hostname` reports:
+# hostnamectl prints static, transient and pretty forms independently, the
+# journal stamps whichever the kernel had at boot, and /etc/hostname is free
+# text. Gather every form, then verify against all of them.
+mask_gather() {
+    local v
+
+    for v in "$(hostname 2>/dev/null)" "$(hostname -s 2>/dev/null)" \
+             "$(hostname -f 2>/dev/null)" "$(uname -n 2>/dev/null)" \
+             "$(cat /etc/hostname 2>/dev/null)"; do
+        mask_add host "$v"
     done
-
-    # The machine-id also appears unlabelled, as a path component in journald
-    # messages (/var/log/journal/<machine-id>/…), which the labelled rule above
-    # cannot reach. Replace the value itself.
-    mach_id="$(cat /etc/machine-id 2>/dev/null)"
-    if [ -n "$mach_id" ]; then
-        case "$mach_id" in
-            *[!0-9a-fA-F]*) : ;;   # not a plain hex id — leave it alone
-            *) sed_pass "machine-id" "s/${mach_id}/<machine-id-redacted>/g" ;;
-        esac
+    if command -v hostnamectl >/dev/null 2>&1; then
+        while IFS= read -r v; do
+            mask_add host "$v"
+        done <<< "$(hostnamectl 2>/dev/null \
+                    | sed -n 's/^[[:space:]]*\(Static\|Transient\|Pretty\) hostname:[[:space:]]*//p')"
     fi
 
+    mask_add mid "$(cat /etc/machine-id 2>/dev/null)"
+
+    # Hardware identity, as dmidecode actually prints it, plus the account names
+    # that appear in ps/lsof/ls/coredumpctl output where no labelled rule reaches.
+    if command -v dmidecode >/dev/null 2>&1; then
+        while IFS= read -r v; do
+            case "$v" in
+                ''|'Not Specified'|'Not Provided'|'Unknown'|'Default string'|\
+                'To be filled by O.E.M.'|'None'|*[!!-~]*) continue ;;
+            esac
+            mask_add id "$v"
+        done <<< "$(dmidecode -t 1 -t 2 -t 3 -t 4 -t 17 2>/dev/null \
+                    | sed -n 's/^[[:space:]]*\(Serial Number\|UUID\|Asset Tag\):[[:space:]]*//p')"
+    fi
+    mask_add id "${SUDO_USER:-}"
+    mask_add id "$(logname 2>/dev/null)"
+}
+
+# Escape every character that is live in a BRE and in the s/// delimiter.
+mask_escape() { printf '%s' "$1" | sed 's/[][\\.^$*/&]/\\&/g'; }
+
+# Fixed expressions. A syntax error here is a defect in this script, so each is
+# applied on its own: one unsupported construct then costs one rule instead of
+# disabling the whole set, which is what would happen on a non-GNU sed.
+# Assembled rather than written inline so the line stays readable: it marks a
+# quad that is directly introduced as a version, by replacing its dots, so the
+# IPv4 rule below cannot see a quad. The dots are restored after that rule runs.
+_VER_MARK='\([Vv]ersion[: ]\+\|[Rr]evision[: ]\+\|\bfw[ =]\+\|\bv\)'
+_VER_QUAD='\([0-9]\{1,3\}\)\.\([0-9]\{1,3\}\)\.\([0-9]\{1,3\}\)\.\([0-9]\{1,3\}\)'
+_VER_GUARD_EXPR="s/${_VER_MARK}${_VER_QUAD}/\\1\\2@@D@@\\3@@D@@\\4@@D@@\\5/g"
+
+IDENTITY_EXPRS=(
+    # MAC. Anchored on both sides so it cannot consume six octets out of the
+    # middle of an 8-octet WWN, which would destroy the WWN as diagnostic data
+    # while leaving the rest of it in place.
+    's/\(^\|[^:0-9A-Fa-f]\)\([0-9A-Fa-f]\{2\}:\)\{5\}[0-9A-Fa-f]\{2\}\([^:0-9A-Fa-f]\|$\)/\1<mac-redacted>\3/g'
+    # IPv6 and other colon-hex identifiers (WWN, NQN fragments). Needs four
+    # or more groups, so a PCI BDF (two colons) and a timestamp are untouched.
+    's/\b[0-9A-Fa-f]\{0,4\}\(:[0-9A-Fa-f]\{0,4\}\)\{3,7\}\b/<hex-id-redacted>/g'
+    # IPv4. The exemption is deliberately narrow: it disarms only a quad that is
+    # directly introduced as a version, rather than exempting a whole line that
+    # happens to contain the word "firmware" — which in a CXL report is most of
+    # them, and would let a real address through.
+    "$_VER_GUARD_EXPR"
+    's/\b\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}\([^-.0-9A-Za-z]\|$\)/<ipv4-redacted>\2/g'
+
+    's/^\([[:space:]]*Machine ID:\).*/\1 <redacted>/'
+    's/^\([[:space:]]*Serial Number:\).*/\1 <redacted>/'
+    's/^\([[:space:]]*UUID:\).*/\1 <redacted>/'
+    's/^\([[:space:]]*Asset Tag:\).*/\1 <redacted>/'
+    's/SUDO_USER=[^ ]*/SUDO_USER=<redacted>/g'
+    's/uid=\([0-9]*\)([^)]*)/uid=\1(<redacted>)/g'
+    's/gid=\([0-9]*\)([^)]*)/gid=\1(<redacted>)/g'
+    's/\([0-9]\{1,7\}\)([a-z_][a-z0-9_-]*)/\1(<redacted>)/g'
+    # Home directories carry the account name through ps args and coredump paths.
+    's|/home/[A-Za-z0-9._-]\{1,32\}|/home/<user-redacted>|g'
+    's|/Users/[A-Za-z0-9._-]\{1,32\}|/Users/<user-redacted>|g'
+)
+
+mask_apply() {
+    local expr err applied=0
+    for expr in "${IDENTITY_EXPRS[@]}"; do
+        if ! err="$(sed -i -e "$expr" "$REPORT_FILE" 2>&1)"; then
+            log ""
+            log "MASKING: expression not applied on this system's sed:"
+            log "  $expr"
+            [ -n "$err" ] && log "  $err"
+        else
+            applied=$((applied + 1))
+        fi
+    done
+    # Put the dots back into version quads the exemption parked out of the way.
+    sed -i 's/@@D@@/./g' "$REPORT_FILE" 2>/dev/null || true
+
+    # Literal values, longest first so an FQDN is replaced before its short form
+    # leaves a fragment behind. A plain literal substitution is used rather than
+    # a \b-anchored one: \b fails open at a non-word edge, and reports rc=0
+    # while matching nothing.
+    local v esc
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        esc="$(mask_escape "$v")"
+        sed -i "s/${esc}/<host-redacted>/g" "$REPORT_FILE" 2>/dev/null || true
+    done <<< "$(printf '%s' "$MASK_VALUES_HOST" | awk '{ print length, $0 }' \
+                | sort -rn | cut -d' ' -f2-)"
+
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        esc="$(mask_escape "$v")"
+        sed -i "s/${esc}/<machine-id-redacted>/g" "$REPORT_FILE" 2>/dev/null || true
+    done <<< "$MASK_VALUES_MID"
+
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        esc="$(mask_escape "$v")"
+        sed -i "s/${esc}/<redacted>/g" "$REPORT_FILE" 2>/dev/null || true
+    done <<< "$MASK_VALUES_ID"
+
+    [ "$applied" -gt 0 ]
+}
+
+# mask_check_values <newline-separated values> -> prints surviving count
+mask_count_survivors() {
+    local v n=0
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        if grep -qF -- "$v" "$REPORT_FILE" 2>/dev/null; then
+            n=$((n + 1))
+        fi
+    done <<< "$1"
+    printf '%s' "$n"
+}
+
+# The verification the whole design rests on: look for the values themselves in
+# the finished report, and for the address shapes no literal list can enumerate.
+mask_verify() {
+    local rc=0 n
+
+    n="$(mask_count_survivors "$MASK_VALUES_HOST")"
+    if [ -z "$MASK_VALUES_HOST" ]; then
+        MASK_STATE_HOST="NOT VERIFIED - no hostname could be determined"; rc=1
+    elif [ "$n" -eq 0 ]; then
+        MASK_STATE_HOST="MASKED"
+    else
+        MASK_STATE_HOST="NOT MASKED - $n value(s) still present"; rc=1
+    fi
+
+    n="$(mask_count_survivors "$MASK_VALUES_MID")"
+    if [ -z "$MASK_VALUES_MID" ]; then
+        MASK_STATE_MID="NOT VERIFIED - /etc/machine-id unreadable"; rc=1
+    elif [ "$n" -eq 0 ]; then
+        MASK_STATE_MID="MASKED"
+    else
+        MASK_STATE_MID="NOT MASKED - still present"; rc=1
+    fi
+
+    n="$(mask_count_survivors "$MASK_VALUES_ID")"
+
+    # Address shapes cannot be checked with a bare pattern: a version number
+    # preserved on purpose is indistinguishable from an IPv4 address by shape
+    # alone, and grepping for one reports the other as a leak. Ask the question
+    # the rules themselves define instead — apply them again to a copy, and see
+    # whether anything is left for them to change. Idempotence means clean.
+    local shapes=0 recheck
+    recheck="$(mktemp "${TMPDIR:-/tmp}/xcena_mask_recheck_XXXXXX" 2>/dev/null)" || recheck=""
+    if [ -n "$recheck" ]; then
+        if cp "$REPORT_FILE" "$recheck" 2>/dev/null; then
+            local expr
+            for expr in "${IDENTITY_EXPRS[@]}"; do
+                sed -i -e "$expr" "$recheck" 2>/dev/null || true
+            done
+            sed -i 's/@@D@@/./g' "$recheck" 2>/dev/null || true
+            cmp -s "$REPORT_FILE" "$recheck" || shapes=1
+        fi
+        rm -f "$recheck"
+    fi
+
+    if [ "$n" -eq 0 ] && [ "$shapes" -eq 0 ]; then
+        MASK_STATE_ID="MASKED"
+    elif [ "$n" -gt 0 ]; then
+        MASK_STATE_ID="NOT MASKED - $n value(s) still present"; rc=1
+    else
+        MASK_STATE_ID="NOT MASKED - the masking rules still match something"; rc=1
+    fi
+
+    return "$rc"
+}
+
+redact_report() {
+    local rc=0
+    mask_gather
+    mask_apply || rc=1
+    mask_verify || rc=1
     return "$rc"
 }
 
@@ -2199,7 +2380,14 @@ collect_pcie
 # ---------------------------------------------------------------------------
 collect_analysis
 
-report_data_inventory
+# Mask before the closing sections are written, so the inventory below can state
+# what actually happened to each field. Nothing written after this point carries
+# host-identifying data — the inventory names field categories, and the
+# collection block holds counts and section labels.
+REDACT_FAILED=0
+redact_report || REDACT_FAILED=1
+
+report_data_inventory || REDACT_FAILED=1
 
 # Measured after the analysis phase, which re-runs dmesg, cxl and ipmitool.
 END_EPOCH="$(date '+%s')"
@@ -2219,13 +2407,33 @@ fi
 # it would make the terminal total disagree with the total inside the report.
 
 # ---------------------------------------------------------------------------
-# Masking
+# If anything was left unmasked, say so where it cannot be missed
 # ---------------------------------------------------------------------------
-REDACT_FAILED=0
-if ! redact_report; then
-    REDACT_FAILED=1
+if [ "$REDACT_FAILED" -eq 1 ]; then
+    # The detail is in the inventory near the end of a 20,000-line file; nobody
+    # scrolling to check before sending will find it there.
+    _banner_tmp="${REPORT_FILE}.prepend.$$"
+    if {
+        printf '%s\n' \
+          "########################################################################" \
+          "##  THIS REPORT WAS NOT FULLY MASKED                                  ##" \
+          "##                                                                    ##" \
+          "##  Some host-identifying fields are still present. The table at the  ##" \
+          "##  end of this report, under [host-identifying data], names exactly  ##" \
+          "##  which ones and why.                                               ##" \
+          "##                                                                    ##" \
+          "##  Review it by hand before sending this file anywhere.              ##" \
+          "########################################################################" \
+          ""
+        cat "$REPORT_FILE"
+    } > "$_banner_tmp" 2>/dev/null; then
+        mv "$_banner_tmp" "$REPORT_FILE" 2>/dev/null || rm -f "$_banner_tmp"
+    else
+        rm -f "$_banner_tmp"
+    fi
+
     # Rename so the filename cannot assert something the content does not.
-    _failed_name="${REPORT_FILE%.log}_MASKING_FAILED.log"
+    _failed_name="${REPORT_FILE%.log}_NOT_FULLY_MASKED.log"
     if mv "$REPORT_FILE" "$_failed_name" 2>/dev/null; then
         REPORT_FILE="$_failed_name"
     fi
@@ -2257,9 +2465,12 @@ else
 fi
 printf "  Report : ${C_CYAN}%s${C_RESET} (%s)\n" "$REPORT_FILE" "$(du -h "$REPORT_FILE" 2>/dev/null | cut -f1)"
 if [ "$REDACT_FAILED" -eq 1 ]; then
-    printf "\n  ${C_RED}${C_BOLD}MASKING FAILED.${C_RESET} %s\n" \
-           "Host-identifying data is still in the report."
-    printf "  ${C_YELLOW}Do not send it until it has been reviewed by hand.${C_RESET}\n"
+    printf "\n  ${C_RED}${C_BOLD}NOT FULLY MASKED.${C_RESET} %s\n" \
+           "Some host-identifying fields are still present."
+    printf "  ${C_YELLOW}%s${C_RESET}\n" \
+           "See [host-identifying data] at the end of the report for which ones,"
+    printf "  ${C_YELLOW}%s${C_RESET}\n" \
+           "and review by hand before sending it anywhere."
 fi
 if [ "$PRIV_LEVEL" != "root" ]; then
     printf "\n  ${C_RED}${C_BOLD}This report is INCOMPLETE (collected without root).${C_RESET}\n"

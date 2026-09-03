@@ -137,18 +137,24 @@ so it can be reviewed rather than guessed at.
 | --- | --- |
 | hostname, machine-id | `hostnamectl`, and every journal line |
 | chassis, board and CPU serial numbers, UUIDs, asset tags | `dmidecode` |
-| account names of the invoking and logged-in users | `id`, `ps` |
-| MAC and IP addresses | kernel log (see below) |
+| account names, and home-directory paths that contain them | `id`, and process arguments |
+| MAC, IPv4 and IPv6 addresses | kernel log (see below) |
 
 MAC addresses are not collected deliberately — the script runs no network
 commands at all. They appear because the kernel logs a NIC's address when it
 probes the device, and the report includes the kernel log.
 
-Masking is best effort. Labelled fields and well-formed addresses are
-handled, but free-text kernel logs may still contain identifying strings such
-as internal hostnames, application names or custom paths. If the hostname is
-too short or collides with terms used throughout the report, it is left
-unmasked and the report says so rather than risk corrupting the output.
+Every row above is verified rather than assumed: after masking, the report is
+searched for the values themselves, and a row says `MASKED` only when the count
+is zero. If anything survives, the report says so in that table, carries a
+banner at the top, is renamed `_NOT_FULLY_MASKED.log`, and the script exits 3.
+
+Verification can only cover what it was given. Free-text kernel logs may still
+contain identifying strings — an internal hostname mentioned inside an
+application's own log line, a custom path, an identifier in a format no rule
+recognises. A four-part number directly introduced as a version or firmware
+revision is left alone, because it is indistinguishable from an IPv4 address
+and removing it would break the diagnosis.
 
 ## Reading a report
 
