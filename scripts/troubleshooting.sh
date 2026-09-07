@@ -244,6 +244,7 @@ OK_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 FAILED_ITEMS=""
+RUN_OUTPUT=""
 
 log() {
     printf '%s\n' "$*" >> "$REPORT_FILE"
@@ -307,6 +308,7 @@ run_cmd() {
     local output rc
     output="$($TIMEOUT "$@" 2>&1)"
     rc=$?
+    RUN_OUTPUT="$output"
     if [ "$rc" -eq 0 ]; then
         if [ -n "$output" ]; then log "$output"; else log "(no output)"; fi
         status_ok
@@ -1350,6 +1352,8 @@ collect_dax() {
 # ===========================================================================
 # Device Firmware (xcena_cli)
 # ===========================================================================
+IM_DEVICES=""
+
 collect_fw_info() {
     section "Device Firmware (xcena_cli)"
 
@@ -1387,8 +1391,30 @@ collect_fw_info() {
     local i=0
     while [ "$i" -lt "$num_devices" ]; do
         run_cmd "xcena_cli device-info (device $i)" xcena_cli device-info "$i"
+        case "$RUN_OUTPUT" in
+            *"(InfiniteMemory)"*) IM_DEVICES="${IM_DEVICES}${i} " ;;
+        esac
         run_cmd "xcena_cli fw-info (device $i)" xcena_cli fw-info "$i"
         i=$((i + 1))
+    done
+}
+
+# ===========================================================================
+# InfiniteMemory SMART (xcena_cli)
+# ===========================================================================
+collect_im_smart() {
+    section "InfiniteMemory SMART (xcena_cli)"
+
+    if [ -z "$IM_DEVICES" ]; then
+        begin "xcena_cli im get-smart" "xcena_cli im get-smart -v <dev>"
+        log "(no InfiniteMemory device detected — skipped)"
+        status_skip
+        return
+    fi
+
+    local i
+    for i in $IM_DEVICES; do
+        run_cmd "xcena_cli im get-smart (device $i)" xcena_cli im get-smart -v "$i"
     done
 }
 
@@ -1948,7 +1974,7 @@ collect_analysis() {
             a_line ok "AER counters" "all zero"
         fi
     else
-        a_line warn "AER counters" "$aer_total logged errors - see section 10"
+        a_line warn "AER counters" "$aer_total logged errors - see section 11"
     fi
 
     # On a firmware-first host this is where hardware errors actually land, so
@@ -1965,7 +1991,7 @@ collect_analysis() {
     elif [ "$sel_entries" = "0" ]; then
         a_line ok "BMC event log" "0 entries"
     else
-        a_line warn "BMC event log" "$sel_entries entries — see section 10"
+        a_line warn "BMC event log" "$sel_entries entries — see section 11"
     fi
 
     # A DMA driver whose interrupt has never fired is worth a look; on a
@@ -2373,6 +2399,7 @@ collect_memory
 collect_cxl
 collect_dax
 collect_fw_info
+collect_im_smart
 collect_pcie
 
 # ---------------------------------------------------------------------------
