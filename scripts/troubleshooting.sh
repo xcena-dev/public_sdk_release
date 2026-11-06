@@ -1388,6 +1388,14 @@ collect_fw_info() {
         return
     fi
 
+    # `telemetry` only exists in newer xcena_cli builds. On an older build it
+    # would fail as "No such command" for every device, which is not a device
+    # problem, so check the command list once and skip instead.
+    local has_telemetry=0
+    if xcena_cli --help 2>/dev/null | grep -qE '^[[:space:]]+telemetry([[:space:]]|$)'; then
+        has_telemetry=1
+    fi
+
     local i=0
     while [ "$i" -lt "$num_devices" ]; do
         run_cmd "xcena_cli device-info (device $i)" xcena_cli device-info "$i"
@@ -1395,6 +1403,13 @@ collect_fw_info() {
             *"(InfiniteMemory)"*) IM_DEVICES="${IM_DEVICES}${i} " ;;
         esac
         run_cmd "xcena_cli fw-info (device $i)" xcena_cli fw-info "$i"
+        if [ "$has_telemetry" -eq 1 ]; then
+            run_cmd "xcena_cli telemetry (device $i)" xcena_cli telemetry "$i"
+        else
+            begin "xcena_cli telemetry (device $i)" "xcena_cli telemetry $i"
+            log "(this xcena_cli has no telemetry command — skipped)"
+            status_skip
+        fi
         i=$((i + 1))
     done
 }
