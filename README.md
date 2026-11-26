@@ -79,8 +79,8 @@ that produced it, so any result can be reproduced by hand.
 | 1 | Host Validation | `validate_host.sh`, run from the same directory or fetched at a pinned revision |
 | 2 | Host Platform & BIOS | `hostnamectl`, BIOS/board/CPU via `dmidecode`, `lscpu`, DRAM population, **PCIe slot inventory with per-slot CXL capability**, Secure Boot, clock sync |
 | 3 | Software & Tool Versions | `cxl`/`daxctl`/`ndctl`/`numactl`/`lspci` versions, XCENA packages, `modinfo mx_dma`, CXL/DAX module versions, MU toolchain |
-| 4 | Kernel | `/proc/cmdline`, `CONFIG_CXL_*` build options, loaded modules, taint state, module parameters, IOMMU/DMA remapping, `dmesg -T` plus a filtered view, previous boot's kernel journal |
-| 5 | XCENA Runtime | `mx_dma` device nodes and messages, `pxl_resourced` status/unit/journal, running processes, interrupt delivery, holders of `/dev/dax*`, `memlock` limits, SELinux/AppArmor, udev rules, core dumps |
+| 4 | Kernel | `/proc/cmdline`, `CONFIG_CXL_*` build options, loaded modules, taint state, module parameters, IOMMU/DMA remapping, `dmesg -T` plus a filtered view, previous boot's kernel journal, and the CXL/DAX/ccma lines of up to 10 earlier boots |
+| 5 | XCENA Runtime | `mx_dma` device nodes and messages, `pxl_resourced` status/unit/journal, running processes, interrupt delivery, holders of `/dev/dax*`, `memlock` limits, SELinux/AppArmor, udev rules, core dumps, ccma state (parameters, `reserve_pct`, `meminfo`, `sources`, holders of `/dev/ccma`) and the modprobe/modules-load lines that load or block ccma |
 | 6 | Memory & NUMA | `/proc/iomem`, NUMA topology and distances, `lsmem`, **HMAT bandwidth/latency per node**, memory block zones, tiering, THP/pressure counters, EDAC error counters |
 | 7 | CXL Subsystem | Full `cxl list` topology, **device health / partition / alert configuration**, every CXL sysfs attribute *value*, CDAT, debugfs, and the CEDT, SRAT, HMAT, SLIT, MCFG and HEST ACPI tables |
 | 8 | DAX | `daxctl` regions and devices, sysfs attributes, `devdax` mode check |

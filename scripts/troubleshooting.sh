@@ -1009,6 +1009,49 @@ collect_kernel() {
 
     run_sh "Kernel journal - previous boot" \
            "journalctl -k -b -1 -o short-precise --no-pager -n 3000 2>&1 || echo '(no previous boot recorded / journald not persistent)'"
+
+    # Recovering from an incident usually takes more than one reboot, so by the
+    # time this runs the incident can be several boots back. For the boots
+    # before the previous one, keep only the CXL/DAX/ccma lines: the head holds
+    # the boot-time topology, the tail holds what happened while it ran.
+    local earlier_boots=10 keep=150
+    [ "$FULL_MODE" -eq 1 ] && keep=0
+    begin "Kernel journal - earlier boots (CXL/DAX/ccma lines)" \
+          "journalctl -k -b -N | grep -iE 'cxl|dax|ccma|...'  (N = 2..$((earlier_boots + 1)))"
+    if ! command -v journalctl >/dev/null 2>&1; then
+        log "(journalctl not installed — skipped)"
+        status_skip
+    else
+        local b boot_log matched shown=0
+        log "[boots recorded]"
+        $TIMEOUT journalctl --list-boots --no-pager 2>&1 | tail -n $((earlier_boots + 3)) >> "$REPORT_FILE"
+        for b in $(seq 2 $((earlier_boots + 1))); do
+            boot_log="$($TIMEOUT journalctl -k -b "-$b" -o short-precise --no-pager 2>/dev/null)" || break
+            case "$boot_log" in ''|*'-- No entries --'*) break ;; esac
+            shown=$((shown + 1))
+            matched="$(printf '%s\n' "$boot_log" \
+                | grep -iE 'Linux version|Command line|cxl|dax|ccma|kmem|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error' \
+                | awk -v keep="$keep" '
+                    { line[NR] = $0 }
+                    END {
+                        if (keep == 0 || NR <= 2 * keep) { for (i = 1; i <= NR; i++) print line[i]; exit }
+                        for (i = 1; i <= keep; i++) print line[i]
+                        printf "  ... (%d lines omitted; --full keeps them) ...\n", NR - 2 * keep
+                        for (i = NR - keep + 1; i <= NR; i++) print line[i]
+                    }')"
+            log ""
+            log "--- boot -$b ---"
+            log "${matched:-(no matching lines)}"
+        done
+        if [ "$shown" -eq 0 ]; then
+            log ""
+            log "(no kernel messages from a boot before the previous one: journald keeps"
+            log " none, or they cannot be read without root — see the boot list above)"
+            status_skip
+        else
+            status_ok
+        fi
+    fi
 }
 
 # ===========================================================================
@@ -1131,6 +1174,80 @@ collect_runtime() {
                 echo '(coredumpctl not available)'
             fi
             echo; echo \"core_pattern: \$(cat /proc/sys/kernel/core_pattern 2>/dev/null)\""
+
+    # ccma reserves CXL memory for PXL. Its counters say how much it holds, and
+    # rmmod fails while any process below still holds /dev/ccma.
+    begin "ccma module state" \
+          "/sys/module/ccma, /sys/class/misc/ccma/{reserve_pct,meminfo,sources}, holders of /dev/ccma"
+    if [ ! -d /sys/module/ccma ]; then
+        log "(ccma is not loaded)"
+        status_skip
+    else
+        log "[module]"
+        local v p a fd pid holders=""
+        v="$(sysread /sys/module/ccma/version)"
+        log "  version = ${v:-N/A}  srcversion = $(sysread /sys/module/ccma/srcversion)"
+        log ""
+        log "[parameters]"
+        for p in /sys/module/ccma/parameters/*; do
+            [ -f "$p" ] || continue
+            log "$(printf '  %-28s = %s' "$(basename "$p")" "$($TO2 cat "$p" 2>/dev/null)")"
+        done
+        for a in reserve_pct meminfo sources; do
+            log ""
+            log "[/sys/class/misc/ccma/$a]"
+            if [ -e "/sys/class/misc/ccma/$a" ]; then
+                v="$($TO2 cat "/sys/class/misc/ccma/$a" 2>&1)"
+                log "$(printf '%s\n' "${v:-(empty)}" | sed 's/^/  /')"
+            else
+                log "  (not present in this ccma version)"
+            fi
+        done
+        for fd in /proc/[0-9]*/fd/*; do
+            [ "$(readlink "$fd" 2>/dev/null)" = /dev/ccma ] || continue
+            pid="${fd#/proc/}"
+            pid="${pid%%/*}"
+            holders="${holders}  PID ${pid} $(cat "/proc/${pid}/comm" 2>/dev/null)"$'\n'
+        done
+        log ""
+        log "[processes holding /dev/ccma]"
+        if [ -n "$holders" ]; then
+            printf '%s' "$holders" | sort -u >> "$REPORT_FILE"
+        else
+            log "  (none)"
+        fi
+        status_ok
+    fi
+
+    # The ccma installer adds 'softdep kmem pre: ccma', which loads ccma again
+    # whenever kmem loads; an 'install ccma ...' line left behind by a script
+    # keeps it out. Show what modprobe applies, then the files it comes from.
+    run_sh "ccma / kmem module load configuration" \
+           "echo '[effective modprobe configuration]'
+            modprobe --showconfig 2>/dev/null \
+              | grep -E '^(softdep|install|remove|blacklist|options) ' \
+              | grep -wE 'ccma|kmem' \
+              || echo '  (no softdep/install/remove/blacklist/options line names ccma or kmem)'
+            echo
+            echo '[configuration files that name ccma]'
+            dirs=\$(for d in /etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d /lib/modprobe.d \
+                             /etc/modules-load.d /run/modules-load.d /usr/lib/modules-load.d /lib/modules-load.d; do
+                        [ -d \"\$d\" ] && readlink -f \"\$d\"
+                    done | sort -u)
+            found=0
+            for d in \$dirs; do
+                for f in \"\$d\"/*.conf; do
+                    [ -f \"\$f\" ] && grep -qw ccma \"\$f\" || continue
+                    found=1
+                    echo \"--- \$f ---\"
+                    grep -vE '^[[:space:]]*(#|\$)' \"\$f\"
+                done
+            done
+            if [ -f /etc/modules ] && grep -qw ccma /etc/modules; then
+                found=1; echo '--- /etc/modules ---'; grep -w ccma /etc/modules
+            fi
+            [ \"\$found\" -eq 0 ] && echo '  (none)'
+            exit 0"
 }
 
 # ===========================================================================
