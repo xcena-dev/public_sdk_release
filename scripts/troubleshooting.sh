@@ -1010,10 +1010,6 @@ collect_kernel() {
     run_sh "Kernel journal - previous boot" \
            "journalctl -k -b -1 -o short-precise --no-pager -n 3000 2>&1 || echo '(no previous boot recorded / journald not persistent)'"
 
-    # Recovering from an incident usually takes more than one reboot, so by the
-    # time this runs the incident can be several boots back. For the boots
-    # before the previous one, keep only the CXL/DAX/ccma lines: the head holds
-    # the boot-time topology, the tail holds what happened while it ran.
     local earlier_boots=10 keep=150
     [ "$FULL_MODE" -eq 1 ] && keep=0
     begin "Kernel journal - earlier boots (CXL/DAX/ccma lines)" \
@@ -1030,14 +1026,18 @@ collect_kernel() {
             case "$boot_log" in ''|*'-- No entries --'*) break ;; esac
             shown=$((shown + 1))
             matched="$(printf '%s\n' "$boot_log" \
-                | grep -iE 'Linux version|Command line|cxl|dax|ccma|kmem|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error' \
                 | awk -v keep="$keep" '
-                    { line[NR] = $0 }
+                    {
+                        msg = $0
+                        sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ /, "", msg)
+                        if (tolower(msg) ~ /linux version|command line|cxl|dax|ccma|kmem|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error/)
+                            line[++n] = $0
+                    }
                     END {
-                        if (keep == 0 || NR <= 2 * keep) { for (i = 1; i <= NR; i++) print line[i]; exit }
+                        if (keep == 0 || n <= 2 * keep) { for (i = 1; i <= n; i++) print line[i]; exit }
                         for (i = 1; i <= keep; i++) print line[i]
-                        printf "  ... (%d lines omitted; --full keeps them) ...\n", NR - 2 * keep
-                        for (i = NR - keep + 1; i <= NR; i++) print line[i]
+                        printf "  ... (%d lines omitted; --full keeps them) ...\n", n - 2 * keep
+                        for (i = n - keep + 1; i <= n; i++) print line[i]
                     }')"
             log ""
             log "--- boot -$b ---"
@@ -1112,7 +1112,7 @@ collect_runtime() {
     # can. PID, command and arguments are what diagnose a stuck daemon.
     run_sh "XCENA/PXL processes" \
            "ps -eo pid,ppid,pcpu,pmem,rss,etime,stat,comm,args --no-headers 2>/dev/null \
-              | awk '\$8 ~ /^(pxl|xcena|xtop|mx_)/' \
+              | awk '\$8 ~ /^(pxl|xcena|xtop|mx_|cxlmem)/' \
               | head -40
             echo '(matched on executable name; empty means no XCENA process is running)'"
 
@@ -1175,8 +1175,6 @@ collect_runtime() {
             fi
             echo; echo \"core_pattern: \$(cat /proc/sys/kernel/core_pattern 2>/dev/null)\""
 
-    # ccma reserves CXL memory for PXL. Its counters say how much it holds, and
-    # rmmod fails while any process below still holds /dev/ccma.
     begin "ccma module state" \
           "/sys/module/ccma, /sys/class/misc/ccma/{reserve_pct,meminfo,sources}, holders of /dev/ccma"
     if [ ! -d /sys/module/ccma ]; then
@@ -1219,9 +1217,6 @@ collect_runtime() {
         status_ok
     fi
 
-    # The ccma installer adds 'softdep kmem pre: ccma', which loads ccma again
-    # whenever kmem loads; an 'install ccma ...' line left behind by a script
-    # keeps it out. Show what modprobe applies, then the files it comes from.
     run_sh "ccma / kmem module load configuration" \
            "echo '[effective modprobe configuration]'
             modprobe --showconfig 2>/dev/null \
@@ -1248,6 +1243,52 @@ collect_runtime() {
             fi
             [ \"\$found\" -eq 0 ] && echo '  (none)'
             exit 0"
+
+    begin "cxlmemd service" \
+          "systemctl status/cat cxlmemd, /etc/default/cxlmemd, /var/lib/cxlmemd"
+    if ! systemctl cat cxlmemd.service >/dev/null 2>&1; then
+        log "(cxlmemd.service is not installed)"
+        status_skip
+    else
+        local m
+        log "[status]"
+        log "$($TIMEOUT systemctl status cxlmemd.service --no-pager -l 2>&1)"
+        log ""
+        log "enabled: $(systemctl is-enabled cxlmemd.service 2>&1)"
+        log ""
+        log "[unit]"
+        log "$(systemctl cat cxlmemd.service 2>&1)"
+        log ""
+        log "[/etc/default/cxlmemd, settings only]"
+        if [ -f /etc/default/cxlmemd ]; then
+            log "$(grep -vE '^[[:space:]]*(#|$)' /etc/default/cxlmemd || echo '  (every line is a comment: all defaults)')"
+        else
+            log "  (not present)"
+        fi
+        log ""
+        log "[/var/lib/cxlmemd]"
+        if [ -d /var/lib/cxlmemd ]; then
+            log "$(ls -la --time-style=full-iso /var/lib/cxlmemd 2>&1)"
+            for m in /var/lib/cxlmemd/*.dirty; do
+                [ -f "$m" ] || continue
+                log "--- $m ---"
+                log "$(head -c 512 "$m" 2>&1 | tr -d '\000')"
+            done
+        else
+            log "  (not present)"
+        fi
+        status_ok
+    fi
+
+    local cxlmemd_limit="-n 20000"
+    [ "$FULL_MODE" -eq 1 ] && cxlmemd_limit=""
+    run_sh "cxlmemd journal (every boot kept)" \
+           "if systemctl cat cxlmemd.service >/dev/null 2>&1; then
+                journalctl -u cxlmemd.service -o short-precise --no-pager $cxlmemd_limit 2>&1 \
+                  || echo '(journald unavailable)'
+            else
+                echo '(cxlmemd.service is not installed)'
+            fi"
 }
 
 # ===========================================================================
