@@ -1009,6 +1009,49 @@ collect_kernel() {
 
     run_sh "Kernel journal - previous boot" \
            "journalctl -k -b -1 -o short-precise --no-pager -n 3000 2>&1 || echo '(no previous boot recorded / journald not persistent)'"
+
+    local earlier_boots=10 keep=150
+    [ "$FULL_MODE" -eq 1 ] && keep=0
+    begin "Kernel journal - earlier boots (CXL/DAX/ccma lines)" \
+          "journalctl -k -b -N | grep -iE 'cxl|dax|ccma|...'  (N = 2..$((earlier_boots + 1)))"
+    if ! command -v journalctl >/dev/null 2>&1; then
+        log "(journalctl not installed — skipped)"
+        status_skip
+    else
+        local b boot_log matched shown=0
+        log "[boots recorded]"
+        $TIMEOUT journalctl --list-boots --no-pager 2>&1 | tail -n $((earlier_boots + 3)) >> "$REPORT_FILE"
+        for b in $(seq 2 $((earlier_boots + 1))); do
+            boot_log="$($TIMEOUT journalctl -k -b "-$b" -o short-precise --no-pager 2>/dev/null)" || break
+            case "$boot_log" in ''|*'-- No entries --'*) break ;; esac
+            shown=$((shown + 1))
+            matched="$(printf '%s\n' "$boot_log" \
+                | awk -v keep="$keep" '
+                    {
+                        msg = $0
+                        sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ /, "", msg)
+                        if (tolower(msg) ~ /linux version|command line|cxl|dax|ccma|kmem|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error/)
+                            line[++n] = $0
+                    }
+                    END {
+                        if (keep == 0 || n <= 2 * keep) { for (i = 1; i <= n; i++) print line[i]; exit }
+                        for (i = 1; i <= keep; i++) print line[i]
+                        printf "  ... (%d lines omitted; --full keeps them) ...\n", n - 2 * keep
+                        for (i = n - keep + 1; i <= n; i++) print line[i]
+                    }')"
+            log ""
+            log "--- boot -$b ---"
+            log "${matched:-(no matching lines)}"
+        done
+        if [ "$shown" -eq 0 ]; then
+            log ""
+            log "(no kernel messages from a boot before the previous one: journald keeps"
+            log " none, or they cannot be read without root — see the boot list above)"
+            status_skip
+        else
+            status_ok
+        fi
+    fi
 }
 
 # ===========================================================================
@@ -1069,7 +1112,7 @@ collect_runtime() {
     # can. PID, command and arguments are what diagnose a stuck daemon.
     run_sh "XCENA/PXL processes" \
            "ps -eo pid,ppid,pcpu,pmem,rss,etime,stat,comm,args --no-headers 2>/dev/null \
-              | awk '\$8 ~ /^(pxl|xcena|xtop|mx_)/' \
+              | awk '\$8 ~ /^(pxl|xcena|xtop|mx_|cxlmem)/' \
               | head -40
             echo '(matched on executable name; empty means no XCENA process is running)'"
 
@@ -1131,6 +1174,121 @@ collect_runtime() {
                 echo '(coredumpctl not available)'
             fi
             echo; echo \"core_pattern: \$(cat /proc/sys/kernel/core_pattern 2>/dev/null)\""
+
+    begin "ccma module state" \
+          "/sys/module/ccma, /sys/class/misc/ccma/{reserve_pct,meminfo,sources}, holders of /dev/ccma"
+    if [ ! -d /sys/module/ccma ]; then
+        log "(ccma is not loaded)"
+        status_skip
+    else
+        log "[module]"
+        local v p a fd pid holders=""
+        v="$(sysread /sys/module/ccma/version)"
+        log "  version = ${v:-N/A}  srcversion = $(sysread /sys/module/ccma/srcversion)"
+        log ""
+        log "[parameters]"
+        for p in /sys/module/ccma/parameters/*; do
+            [ -f "$p" ] || continue
+            log "$(printf '  %-28s = %s' "$(basename "$p")" "$($TO2 cat "$p" 2>/dev/null)")"
+        done
+        for a in reserve_pct meminfo sources; do
+            log ""
+            log "[/sys/class/misc/ccma/$a]"
+            if [ -e "/sys/class/misc/ccma/$a" ]; then
+                v="$($TO2 cat "/sys/class/misc/ccma/$a" 2>&1)"
+                log "$(printf '%s\n' "${v:-(empty)}" | sed 's/^/  /')"
+            else
+                log "  (not present in this ccma version)"
+            fi
+        done
+        for fd in /proc/[0-9]*/fd/*; do
+            [ "$(readlink "$fd" 2>/dev/null)" = /dev/ccma ] || continue
+            pid="${fd#/proc/}"
+            pid="${pid%%/*}"
+            holders="${holders}  PID ${pid} $(cat "/proc/${pid}/comm" 2>/dev/null)"$'\n'
+        done
+        log ""
+        log "[processes holding /dev/ccma]"
+        if [ -n "$holders" ]; then
+            printf '%s' "$holders" | sort -u >> "$REPORT_FILE"
+        else
+            log "  (none)"
+        fi
+        status_ok
+    fi
+
+    run_sh "ccma / kmem module load configuration" \
+           "echo '[effective modprobe configuration]'
+            modprobe --showconfig 2>/dev/null \
+              | grep -E '^(softdep|install|remove|blacklist|options) ' \
+              | grep -wE 'ccma|kmem' \
+              || echo '  (no softdep/install/remove/blacklist/options line names ccma or kmem)'
+            echo
+            echo '[configuration files that name ccma]'
+            dirs=\$(for d in /etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d /lib/modprobe.d \
+                             /etc/modules-load.d /run/modules-load.d /usr/lib/modules-load.d /lib/modules-load.d; do
+                        [ -d \"\$d\" ] && readlink -f \"\$d\"
+                    done | sort -u)
+            found=0
+            for d in \$dirs; do
+                for f in \"\$d\"/*.conf; do
+                    [ -f \"\$f\" ] && grep -qw ccma \"\$f\" || continue
+                    found=1
+                    echo \"--- \$f ---\"
+                    grep -vE '^[[:space:]]*(#|\$)' \"\$f\"
+                done
+            done
+            if [ -f /etc/modules ] && grep -qw ccma /etc/modules; then
+                found=1; echo '--- /etc/modules ---'; grep -w ccma /etc/modules
+            fi
+            [ \"\$found\" -eq 0 ] && echo '  (none)'
+            exit 0"
+
+    begin "cxlmemd service" \
+          "systemctl status/cat cxlmemd, /etc/default/cxlmemd, /var/lib/cxlmemd"
+    if ! systemctl cat cxlmemd.service >/dev/null 2>&1; then
+        log "(cxlmemd.service is not installed)"
+        status_skip
+    else
+        local m
+        log "[status]"
+        log "$($TIMEOUT systemctl status cxlmemd.service --no-pager -l 2>&1)"
+        log ""
+        log "enabled: $(systemctl is-enabled cxlmemd.service 2>&1)"
+        log ""
+        log "[unit]"
+        log "$(systemctl cat cxlmemd.service 2>&1)"
+        log ""
+        log "[/etc/default/cxlmemd, settings only]"
+        if [ -f /etc/default/cxlmemd ]; then
+            log "$(grep -vE '^[[:space:]]*(#|$)' /etc/default/cxlmemd || echo '  (every line is a comment: all defaults)')"
+        else
+            log "  (not present)"
+        fi
+        log ""
+        log "[/var/lib/cxlmemd]"
+        if [ -d /var/lib/cxlmemd ]; then
+            log "$(ls -la --time-style=full-iso /var/lib/cxlmemd 2>&1)"
+            for m in /var/lib/cxlmemd/*.dirty; do
+                [ -f "$m" ] || continue
+                log "--- $m ---"
+                log "$(head -c 512 "$m" 2>&1 | tr -d '\000')"
+            done
+        else
+            log "  (not present)"
+        fi
+        status_ok
+    fi
+
+    local cxlmemd_limit="-n 20000"
+    [ "$FULL_MODE" -eq 1 ] && cxlmemd_limit=""
+    run_sh "cxlmemd journal (every boot kept)" \
+           "if systemctl cat cxlmemd.service >/dev/null 2>&1; then
+                journalctl -u cxlmemd.service -o short-precise --no-pager $cxlmemd_limit 2>&1 \
+                  || echo '(journald unavailable)'
+            else
+                echo '(cxlmemd.service is not installed)'
+            fi"
 }
 
 # ===========================================================================
