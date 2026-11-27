@@ -1931,6 +1931,20 @@ slot_for_bdf() {
         }'
 }
 
+cxl_bound_to_bdf() {
+    local m parent mems="" drv
+    for m in /sys/bus/cxl/devices/mem*; do
+        [ -e "$m" ] || continue
+        parent="$(dirname "$(readlink -f "$m" 2>/dev/null)")"
+        [ "$(basename "$parent")" = "$1" ] && mems="${mems:+$mems }$(basename "$m")"
+    done
+    if [ -z "$mems" ]; then
+        drv="$(readlink "/sys/bus/pci/devices/$1/driver" 2>/dev/null)"
+        [ "${drv##*/}" = "cxl_pci" ] && mems="cxl_pci"
+    fi
+    printf '%s' "$mems"
+}
+
 # ===========================================================================
 # Summary analysis
 # ===========================================================================
@@ -1944,7 +1958,7 @@ collect_analysis() {
     # ---- device chain ---------------------------------------------------
     a_head "device chain"
 
-    local bdfs bdf slot des cap
+    local bdfs bdf slot des cap bound
     bdfs="$( { lspci -D -d 20a6: 2>/dev/null
                lspci -D -d ::0502 2>/dev/null
                lspci -D 2>/dev/null | grep -i 'CXL'
@@ -1959,9 +1973,16 @@ collect_analysis() {
             if [ -z "$slot" ]; then
                 a_line ok "XCENA/CXL PCI" "$bdf"
             elif [ "$cap" = "NOT CXL capable" ]; then
-                a_line warn "XCENA/CXL PCI" "$bdf in ${des}"
-                a_cont "this slot is NOT CXL capable - the card will enumerate as"
-                a_cont "plain PCIe and never bind the CXL driver. See section 2."
+                bound="$(cxl_bound_to_bdf "$bdf")"
+                if [ -n "$bound" ]; then
+                    a_line note "XCENA/CXL PCI" "$bdf in ${des}"
+                    a_cont "SMBIOS does not list this slot as CXL capable, but the"
+                    a_cont "CXL driver is bound ($bound). See section 2."
+                else
+                    a_line warn "XCENA/CXL PCI" "$bdf in ${des}"
+                    a_cont "SMBIOS does not list this slot as CXL capable, and the"
+                    a_cont "CXL driver is not bound. See section 2."
+                fi
             else
                 a_line ok "XCENA/CXL PCI" "$bdf  slot: ${des}  ($cap)"
             fi
