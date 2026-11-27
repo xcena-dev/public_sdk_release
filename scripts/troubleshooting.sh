@@ -1030,7 +1030,8 @@ collect_kernel() {
                     {
                         msg = $0
                         sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ /, "", msg)
-                        if (tolower(msg) ~ /linux version|command line|cxl|dax|ccma|kmem|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error/)
+                        if (tolower(msg) ~ /linux version|command line|cxl|dax|ccma|kmem|mx_dma|pxl|aer|soft reserved|hmat|firmware first|acpi.*error|pcie.*error/ ||
+                            tolower(msg) ~ /dmi:|acpi: (cedt|srat) 0x|warning: (cpu:|.*cpu#)|(^|[^a-z])(bug|oops):|kernel bug at|page allocation failure|info: task .*blocked/)
                             line[++n] = $0
                     }
                     END {
